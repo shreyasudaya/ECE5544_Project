@@ -292,6 +292,87 @@ This project intentionally stays small and educational. It is not a full polyhed
 - automatic cost-model-driven search over all schedules
 - sophisticated alias analysis beyond conservative checks
 
+## How to Run
+
+### Using Docker
+
+#### 1. Build the Docker image
+
+```bash
+docker-compose build
+```
+
+This builds the container with all required dependencies (LLVM, clang, perf tools).
+
+#### 2. Run the container
+
+```bash
+docker-compose run --rm work
+```
+
+This starts an interactive shell inside the container at `/work`, where the project is mounted.
+
+### Inside the container (or natively)
+
+#### Build the pass plugin
+
+```bash
+make
+```
+
+This compiles the polyhedral pass plugin (`polyhedralpass.so`).
+
+#### Build all test bitcode
+
+```bash
+make tests
+```
+
+This compiles all test C files to LLVM bitcode (both m2r and opt versions).
+
+#### Run analysis targets
+
+**Compare instruction counts (m2r vs opt):**
+
+```bash
+make analyze
+```
+
+or run directly:
+
+```bash
+./scripts/lli-compare.sh
+```
+
+Output shows a table with instruction counts for each test case, comparing the m2r (untransformed) version against the opt (optimized) version.
+
+**Run perf-based cache analysis:**
+
+```bash
+make perf
+```
+
+This runs both the instruction comparison and cache miss analysis, showing:
+- L1 data cache miss percentages
+- dTLB miss percentages
+
+#### Run standalone scripts
+
+Both analysis scripts can also be executed directly:
+
+```bash
+./scripts/lli-compare.sh
+./scripts/perf-profile.sh
+```
+
+#### Clean build artifacts
+
+```bash
+make clean
+```
+
+Both scripts are hardcoded to analyze bitcode files in `./build/tests/polyhedral-pass/`.
+
 ## Deliverables
 
 The final project should include:

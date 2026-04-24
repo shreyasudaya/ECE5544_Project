@@ -18,7 +18,7 @@ OPTIMIZER_SOURCES = polyhedralpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 
 # --- Tests ---
-TEST_SRCS    = $(wildcard tests/*.c)
+TEST_SRCS    = $(wildcard tests/*/*.c)
 TESTS        = $(TEST_SRCS:tests/%.c=%)
 TESTS_PRE    = $(TESTS:%=$(TESTDIR)/%-m2r.ll)
 TESTS_OUT    = $(TESTS:%=$(TESTDIR)/%-opt.ll)
@@ -27,12 +27,22 @@ TESTS_OUT    = $(TESTS:%=$(TESTDIR)/%-opt.ll)
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 DEPFILES     = $(OPTIMIZER_SOURCES:%.cpp=$(DEPDIR)/%.d)
 
-.PHONY: all clean tests
+.PHONY: clean tests analyze perf
 .SECONDARY: # This ensures Make doesn't delete your intermediate .bc files
 
-all: $(OPTIMIZER_LIBS)
+$(OPTIMIZER_LIBS): # Default target - builds the pass plugin
 
 tests: $(TESTS_PRE) $(TESTS_OUT)
+
+analyze: $(OPTIMIZER_LIBS) tests
+	@echo "\n========== Running Analysis =========="
+	./scripts/lli-compare.sh
+
+perf: $(OPTIMIZER_LIBS) tests
+	@echo "\n========== Running LLI Comparison =========="
+	./scripts/lli-compare.sh
+	@echo "\n========== Running Perf Analysis =========="
+	./scripts/perf-profile.sh
 
 clean:
 	rm -rf $(BUILDDIR)

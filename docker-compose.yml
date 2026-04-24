@@ -1,0 +1,19 @@
+services:
+  compiler-env:
+    build: .
+    image: custom-llvm21-with-perf
+    privileged: true
+    pid: "host"
+    network_mode: "host"
+    cap_add:
+      - PERFMON
+      - SYS_ADMIN
+    volumes:
+      - .:/work
+      - /sys:/sys
+      - /proc:/proc
+    working_dir: /work
+    stdin_open: true # Equivalent to -i
+    tty: true        # Equivalent to -t
+
+
