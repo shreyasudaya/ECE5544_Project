@@ -1,50 +1,107 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-PERF_CMD="perf"
-TARGET_DIR="./build/tests/polyhedral-pass"
+set -euo pipefail
 
-# Hardware events specifically chosen for Polyhedral Pass analysis
-# L1-dcache: Shows if tiling/interchange improved spatial locality
-# LLC: Shows if the problem size fits in cache or is hitting RAM
-# dTLB: Shows if memory access patterns are predictable
-PERF_EVENTS="L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,dTLB-loads,dTLB-load-misses"
+TARGET_DIR="${1:-./build/benchmarks/tile-32}"
+PERF_BIN="${PERF_BIN:-perf}"
+PERF_EVENTS="${POLY_PERF_EVENTS:-task-clock,L1-dcache-load-misses,cache-misses,cache-references}"
 
-echo ""
-echo "╔════════════════════╦══════════════════╦══════════════════╦═══════════════╦═══════════════╗"
-printf "║ %-18s ║ %16s ║ %16s ║ %13s ║ %13s ║\n" "Test" "L1-dcache (m2r)" "L1-dcache (opt)" "dTLB (m2r)" "dTLB (opt)"
-echo "╠════════════════════╬══════════════════╬══════════════════╬═══════════════╬═══════════════╣"
+if [[ ! -d "$TARGET_DIR" ]]; then
+  echo "error: '$TARGET_DIR' is not a directory"
+  exit 1
+fi
 
-# Process bitcode files
-find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
-    prefix="${base_bc%-m2r.bc}"
-    opt_bc="${prefix}-opt.bc"
-    display_name=$(basename "$prefix")
+run_perf() {
+  local executable="$1"
+  "$PERF_BIN" stat -x, -e "$PERF_EVENTS" "$executable" 2>&1 >/dev/null
+}
 
-    if [ ! -f "$opt_bc" ]; then
-        continue
-    fi
+extract_metric() {
+  local perf_output="$1"
+  local metric_name="$2"
+  awk -F, -v metric="$metric_name" '
+    $3 == metric {
+      gsub(/[[:space:]]/, "", $1);
+      print $1;
+      found = 1;
+      exit;
+    }
+    END {
+      if (!found) {
+        print 0;
+      }
+    }
+  ' <<<"$perf_output"
+}
 
-    # Run perf and extract counts
-    m2r_output=$($PERF_CMD stat -e "$PERF_EVENTS" lli "$base_bc" 2>&1)
-    opt_output=$($PERF_CMD stat -e "$PERF_EVENTS" lli "$opt_bc" 2>&1)
-    
-    m2r_l1dcload=$(echo "$m2r_output" | grep "L1-dcache-loads" | awk '{print $1}' | tr -d ',')
-    opt_l1dcload=$(echo "$opt_output" | grep "L1-dcache-loads" | awk '{print $1}' | tr -d ',')
-    m2r_l1dcmiss=$(echo "$m2r_output" | grep "L1-dcache-load-misses" | awk '{print $1}' | tr -d ',')
-    opt_l1dcmiss=$(echo "$opt_output" | grep "L1-dcache-load-misses" | awk '{print $1}' | tr -d ',')
-    m2r_dtlbload=$(echo "$m2r_output" | grep "dTLB-loads" | awk '{print $1}' | tr -d ',')
-    opt_dtlbload=$(echo "$opt_output" | grep "dTLB-loads" | awk '{print $1}' | tr -d ',')
-    m2r_dtlbmiss=$(echo "$m2r_output" | grep "dTLB-load-misses" | awk '{print $1}' | tr -d ',')
-    opt_dtlbmiss=$(echo "$opt_output" | grep "dTLB-load-misses" | awk '{print $1}' | tr -d ',')
-    
-    # Calculate and output miss percentages directly
-    m2r_l1pct=$(awk "BEGIN {printf \"%.2f\", ($m2r_l1dcmiss / $m2r_l1dcload) * 100}")
-    opt_l1pct=$(awk "BEGIN {printf \"%.2f\", ($opt_l1dcmiss / $opt_l1dcload) * 100}")
-    m2r_dtlbpct=$(awk "BEGIN {printf \"%.2f\", ($m2r_dtlbmiss / $m2r_dtlbload) * 100}")
-    opt_dtlbpct=$(awk "BEGIN {printf \"%.2f\", ($opt_dtlbmiss / $opt_dtlbload) * 100}")
-    
-    printf "║ %-18s ║ %15s%% ║ %15s%% ║ %12s%% ║ %12s%% ║\n" "$display_name" "$m2r_l1pct" "$opt_l1pct" "$m2r_dtlbpct" "$opt_dtlbpct"
-done
+extract_elapsed() {
+  local perf_output="$1"
+  awk -F, '
+    $3 == "task-clock" {
+      gsub(/[[:space:]]/, "", $1);
+      print $1 / 1000;  # convert ms → seconds
+      found = 1;
+      exit;
+    }
+    /seconds time elapsed/ {
+      gsub(/[[:space:]]/, "", $1);
+      print $1;
+      found = 1;
+      exit;
+    }
+    END {
+      if (!found) print 0;
+    }
+  ' <<<"$perf_output"
+}
 
-echo "╚════════════════════╩══════════════════╩══════════════════╩═══════════════╩═══════════════╝"
-echo ""
+ratio() {
+  local numerator="$1"
+  local denominator="$2"
+  awk -v numerator="$numerator" -v denominator="$denominator" 'BEGIN {
+    if (denominator == 0) {
+      printf "0.00";
+    } else {
+      printf "%.2f", numerator / denominator;
+    }
+  }'
+}
+
+printf "%-18s %10s %10s %10s %10s %10s %14s %18s\n" \
+  "Benchmark" "raw(s)" "licm(s)" "poly(s)" "p/raw" "p/licm" "L1 poly/raw" "cache-miss poly/raw"
+printf "%-18s %10s %10s %10s %10s %10s %14s %18s\n" \
+  "------------------" "--------" "--------" "--------" "--------" "--------" "--------------" "------------------"
+
+while IFS= read -r raw_exe; do
+  prefix="${raw_exe%-raw}"
+  licm_exe="${prefix}-licm"
+  poly_exe="${prefix}-poly"
+  benchmark_name="$(basename "$prefix")"
+
+  if [[ ! -f "$licm_exe" || ! -f "$poly_exe" ]]; then
+    continue
+  fi
+
+  raw_output="$(run_perf "$raw_exe")"
+  licm_output="$(run_perf "$licm_exe")"
+  poly_output="$(run_perf "$poly_exe")"
+
+  raw_time="$(extract_elapsed "$raw_output")"
+  licm_time="$(extract_elapsed "$licm_output")"
+  poly_time="$(extract_elapsed "$poly_output")"
+
+  raw_l1="$(extract_metric "$raw_output" "L1-dcache-load-misses")"
+  poly_l1="$(extract_metric "$poly_output" "L1-dcache-load-misses")"
+  raw_cache_miss="$(extract_metric "$raw_output" "cache-misses")"
+  poly_cache_miss="$(extract_metric "$poly_output" "cache-misses")"
+
+  printf "%-18s %10s %10s %10s %10sx %10sx %14s %18s\n" \
+    "$benchmark_name" \
+    "$raw_time" \
+    "$licm_time" \
+    "$poly_time" \
+    "$(ratio "$raw_time" "$poly_time")" \
+    "$(ratio "$licm_time" "$poly_time")" \
+    "${poly_l1}/${raw_l1}" \
+    "${poly_cache_miss}/${raw_cache_miss}"
+done < <(find "$TARGET_DIR" -maxdepth 1 -type f -name '*-raw' | sort)

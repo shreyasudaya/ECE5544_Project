@@ -1,66 +1,58 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-TARGET_DIR="./build/tests/polyhedral-pass"
+set -euo pipefail
 
-# Check if the provided path is actually a directory
-if [ ! -d "$TARGET_DIR" ]; then
-    echo "Error: '$TARGET_DIR' is not a valid directory."
-    exit 1
+TARGET_DIR="${1:-./build/benchmarks/tile-32}"
+
+if [[ ! -d "$TARGET_DIR" ]]; then
+  echo "error: '$TARGET_DIR' is not a directory"
+  exit 1
 fi
 
-echo ""
-echo "╔════════════════════╦═══════════════════╦═══════════════════╦═══════════════════╗"
-printf "║ %-18s ║ %17s ║ %17s ║ %17s ║\n" "Test" "m2r (instr)" "opt (instr)" "Diff (%)"
-echo "╠════════════════════╬═══════════════════╬═══════════════════╬═══════════════════╣"
+measure_instructions() {
+  local bitcode_file="$1"
+  local stats
 
-# Find all files ending in -m2r.bc
-find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
-    
-    # Identify the prefix (everything before -m2r.bc)
-    prefix="${base_bc%-m2r.bc}"
-    opt_bc="${prefix}-opt.bc"
-    
-    # Extract clean filename for display
-    display_name=$(basename "$prefix")
+  stats=$(lli -stats -force-interpreter "$bitcode_file" 2>&1 >/dev/null)
+  awk '/instructions executed/ {gsub(/,/, "", $1); print $1; found=1; exit} END {if (!found) print 0}' <<<"$stats"
+}
 
-    # Check if the optimized counterpart exists
-    if [ ! -f "$opt_bc" ]; then
-        continue
-    fi
+percent_delta() {
+  local baseline="$1"
+  local candidate="$2"
+  awk -v baseline="$baseline" -v candidate="$candidate" 'BEGIN {
+    if (baseline == 0) {
+      printf "n/a";
+    } else {
+      printf "%.2f", ((baseline - candidate) / baseline) * 100.0;
+    }
+  }'
+}
 
-    # Run lli with interpreter and stats
-    # 2>&1 merges stderr (where stats live) into stdout so we can grep it
-    m2r_stats=$(lli -stats -force-interpreter "$base_bc" 2>&1 >/dev/null)
-    opt_stats=$(lli -stats -force-interpreter "$opt_bc" 2>&1 >/dev/null)
+printf "%-18s %14s %14s %14s %12s %12s\n" \
+  "Benchmark" "raw instr" "licm instr" "poly instr" "poly/raw%" "poly/licm%"
+printf "%-18s %14s %14s %14s %12s %12s\n" \
+  "------------------" "--------------" "--------------" "--------------" "------------" "------------"
 
-    # Extract the digit count
-    m2r_count=$(echo "$m2r_stats" | grep "instructions executed" | awk '{print $1}' | tr -d ',')
-    opt_count=$(echo "$opt_stats" | grep "instructions executed" | awk '{print $1}' | tr -d ',')
+while IFS= read -r raw_bc; do
+  prefix="${raw_bc%-raw.bc}"
+  licm_bc="${prefix}-licm.bc"
+  poly_bc="${prefix}-poly.bc"
+  benchmark_name="$(basename "$prefix")"
 
-    # Default to 0 if extraction fails
-    m2r_count=${m2r_count:-0}
-    opt_count=${opt_count:-0}
+  if [[ ! -f "$licm_bc" || ! -f "$poly_bc" ]]; then
+    continue
+  fi
 
-    # Calculate difference (positive means opt is better/smaller)
-    diff=$((m2r_count - opt_count))
+  raw_count="$(measure_instructions "$raw_bc")"
+  licm_count="$(measure_instructions "$licm_bc")"
+  poly_count="$(measure_instructions "$poly_bc")"
 
-    # Calculate percentage using awk for float precision, avoiding divide-by-zero
-    if [ "$m2r_count" -gt 0 ] && [ "$diff" -gt 0 ]; then
-        percent=$(awk "BEGIN {printf \"%.2f\", ($diff / $m2r_count) * 100}")
-        diff_display="${diff} (+${percent}%)"
-    else
-        diff_display="${diff}"
-    fi
-
-    # Colorize the output: Red if opt is higher (regression), Green if lower
-    if [ "$diff" -lt 0 ]; then
-        # Red text for regression
-        printf "║ %-18s ║ %17s ║ %17s ║ \e[31m%17s\e[0m ║\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
-    else
-        # Green text for improvement
-        printf "║ %-18s ║ %17s ║ %17s ║ \e[32m%17s\e[0m ║\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
-    fi
-done
-
-echo "╚════════════════════╩═══════════════════╩═══════════════════╩═══════════════════╝"
-echo ""
+  printf "%-18s %14s %14s %14s %12s %12s\n" \
+    "$benchmark_name" \
+    "$raw_count" \
+    "$licm_count" \
+    "$poly_count" \
+    "$(percent_delta "$raw_count" "$poly_count")" \
+    "$(percent_delta "$licm_count" "$poly_count")"
+done < <(find "$TARGET_DIR" -maxdepth 1 -type f -name '*-raw.bc' | sort)

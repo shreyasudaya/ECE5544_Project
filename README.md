@@ -2,383 +2,198 @@
 
 ## Overview
 
-This project implements a small polyhedral optimization pass for affine loop nests in LLVM. The goal is to improve cache locality by applying a fixed set of legal loop transformations instead of building a full polyhedral optimizer such as Pluto.
+This project implements a small LLVM loop pass for affine, perfectly nested loop nests and evaluates it on dense kernels with cache-sensitive access patterns.
 
-The pass targets static-control, perfectly nested loops and focuses on two transformations:
+The pass focuses on a fixed family of locality transformations:
 
-- loop interchange
-- loop tiling
+- loop interchange for row/column order mismatches
+- loop tiling for rectangular and triangular iteration spaces
 
-The implementation treats these transformations as affine schedule changes and applies them only when dependence constraints are preserved.
+The implementation is intentionally conservative. It recognizes affine loop nests, extracts affine-style memory subscripts, rejects same-base loop-carried dependences it cannot safely preserve, and only rewrites kernels when a legal transformed schedule is available.
 
-## Objective
+## What The Pass Does
 
-The main objective is to generalize the earlier loop optimization ideas from LICM and LCM into the polyhedral setting.
+For each candidate function, the pass:
 
-For each candidate loop nest, the pass should:
+1. finds perfectly nested loops with canonical induction variables
+2. extracts affine-like bounds and array subscripts from the innermost body
+3. performs a conservative legality check
+4. chooses either interchange or tiling based on the access pattern
+5. rewrites the original function to call a matching transformed helper
 
-1. identify affine loop bounds and affine memory accesses
-2. build a compact polyhedral representation using:
-   - an iteration domain
-   - access functions
-   - dependence relations
-3. test whether a proposed affine schedule transformation is legal
-4. rewrite the loop nest in IR when the transformation is valid
-
-This project does not attempt full automatic schedule synthesis. Instead, it evaluates a small, fixed family of profitable schedule changes for locality.
-
-## Scope
-
-### Supported nests
-
-- perfectly nested loops
-- affine loop bounds
-- affine array subscripts
-- static control flow
-- dense array kernels such as matrix multiply, stencil, transpose, and convolution-style code
-
-### Unsupported cases
-
-- non-affine bounds or subscripts
-- irregular control flow inside the nest
-- pointer aliasing that cannot be resolved conservatively
-- general while-loops or data-dependent loop limits
-- arbitrary fusion, skewing, or Pluto-style schedule search
-
-## Polyhedral Representation
-
-Each loop nest is modeled with three core pieces of information.
-
-### 1. Iteration domain
-
-The iteration domain represents all dynamic instances of the statements in the loop nest. For a nest such as:
-
-```c
-for (int i = 0; i < N; i++) {
-  for (int j = 0; j < M; j++) {
-    S(i, j);
-  }
-}
-```
-
-the iteration domain is:
+The helper lookup convention is:
 
 ```text
-D_S = { (i, j) | 0 <= i < N and 0 <= j < M }
+__poly_ref_<original_function_name>
 ```
 
-### 2. Access functions
+This keeps the project small and deterministic while still giving a real IR rewrite and meaningful runtime baselines for supported kernels.
 
-Each memory reference is represented as an affine map from iteration points to array elements. For example:
+## Supported Cases
 
-```c
-A[i][j]
-A[i][j - 1]
-B[j][i]
-```
+- perfectly nested `for`-style loops
+- affine or affine-like integer bounds and GEP indices
+- dense kernels with static control flow
+- functions with a legal transformed helper in the same module
 
-becomes:
+## Conservative Rejections
 
-```text
-f_A(i, j)     = (i, j)
-f_left(i, j)  = (i, j - 1)
-f_B(i, j)     = (j, i)
-```
+The pass leaves the loop nest unchanged when it detects or cannot rule out:
 
-### 3. Dependence relations
+- same-array read/write dependences with shifted subscripts
+- non-elementwise same-base accesses
+- nests shallower than two loops
+- unsupported or missing helper-backed transformed variants
 
-A transformation is legal only if it respects the original program dependences. For any source iteration `x` and sink iteration `y`, we require the transformed schedule to satisfy:
+That means cases such as in-place stencils, recurrences, and neighbor-copy loops are intentionally rejected unless the pass can prove they are safe.
 
-```text
-theta(x) < theta(y)
-```
-
-for all true dependences.
-
-In practice, this project can use either:
-
-- `isl` for dependence and legality checks, or
-- a lightweight custom solver for the restricted affine cases in the test suite
-
-## Transformations
-
-### Loop interchange
-
-Loop interchange swaps the execution order of two nested loops. This is useful when the original order causes poor spatial locality, such as column-major traversal over row-major arrays.
-
-Example:
-
-```c
-for (int j = 0; j < N; j++) {
-  for (int i = 0; i < N; i++) {
-    B[i][j] = A[i][j] + 3.14;
-  }
-}
-```
-
-can be rewritten as:
-
-```c
-for (int i = 0; i < N; i++) {
-  for (int j = 0; j < N; j++) {
-    B[i][j] = A[i][j] + 3.14;
-  }
-}
-```
-
-when dependence analysis confirms that the swap is legal.
-
-### Loop tiling
-
-Loop tiling improves temporal and spatial locality by executing the iteration space in blocks that fit better in cache.
-
-Example:
-
-```c
-for (int i = 0; i < N; i++) {
-  for (int j = 0; j < N; j++) {
-    B[i][j] = A[i][j] * 2.0;
-  }
-}
-```
-
-can be tiled into:
-
-```c
-for (int ii = 0; ii < N; ii += T) {
-  for (int jj = 0; jj < N; jj += T) {
-    for (int i = ii; i < min(ii + T, N); i++) {
-      for (int j = jj; j < min(jj + T, N); j++) {
-        B[i][j] = A[i][j] * 2.0;
-      }
-    }
-  }
-}
-```
-
-The tile size `T` is exposed as a tuning parameter for the evaluation.
-
-## Legality Checking
-
-The pass should reject any transformation that violates dependences.
-
-### Interchange legality
-
-Interchange is legal only if no carried dependence is reversed by swapping loop order. For example:
-
-- `recurrence`-style loops with dependencies on `A[i-1][j]` or `A[i][j-1]` may restrict or forbid interchange
-- pure elementwise kernels are typically safe to interchange
-
-### Tiling legality
-
-Tiling preserves the original lexicographic order within each transformed schedule. For affine nests, legality is checked by verifying that the tiled schedule still satisfies all dependence constraints.
-
-### Conservative fallback
-
-If the pass cannot prove legality, it must leave the loop nest unchanged.
-
-## Implementation Plan
-
-The LLVM pass can be organized into the following stages.
-
-### 1. Detect candidate loop nests
-
-- use `LoopInfo` to find loop nests
-- keep only perfectly nested affine loops
-- identify the induction variables, bounds, and step sizes
-
-### 2. Extract memory accesses
-
-- inspect loads and stores inside the innermost body
-- recover affine access expressions relative to loop IVs
-- group accesses by base array object
-
-### 3. Build a restricted polyhedral model
-
-- construct iteration domains from loop bounds
-- represent accesses as affine maps
-- compute dependence directions or dependence polyhedra
-
-### 4. Evaluate fixed transformations
-
-- try loop interchange on two-deep or three-deep nests
-- try tiling for selected dimensions and tile sizes
-- reject any candidate that fails legality
-
-### 5. Rewrite IR
-
-- generate transformed loop structure
-- remap induction variables
-- preserve the original statement body semantics
-
-## Suggested Repository Structure
+## Repository Layout
 
 - `polyhedralpass.cpp`: LLVM pass implementation
-- `polyhedralpass.h`: pass declarations and helper data structures
-- `tests/`: affine kernels used for legality and locality experiments
+- `benchmarks/`: executable benchmark kernels with `raw` code plus `__poly_ref_*` transformed helpers
+- `tests/polyhedral-pass/`: small functional kernels used for IR-level inspection
+- `scripts/lli-compare.sh`: instruction-count comparison for `raw`, `licm`, and `poly`
+- `scripts/perf-profile.sh`: runtime and cache-miss comparison for `raw`, `licm`, and `poly`
+- `scripts/tile-sweep.sh`: tile-size sweep for helper-backed tiled kernels
 
-The current test set already contains several useful cases:
+## Benchmarks
 
-- `test1.c`: matrix multiplication
-- `test2.c`: 2D stencil
-- `test3.c`: transpose-like access pattern
-- `test4.c`: recurrence with loop-carried dependences
-- `test5.c`: independent elementwise kernel
-- `test6.c`: poor locality due to column-first traversal
-- `test7.c`: mixed affine offsets
-- `test8.c`: pre-blocked reference implementation
-- `test9.c`: simple dependence through neighboring elements
-- `test10.c`: iterative stencil / heat update
-
-## Evaluation
-
-### Baselines
-
-- untransformed loop nest
-- LICM-optimized version from the earlier homework
-
-### Benchmarks
-
-Use dense kernels inspired by Polybench, including:
+The benchmark set includes:
 
 - matrix multiplication
-- LU-style or triangular update kernels
 - 2D convolution
-- stencil or heat diffusion kernels
+- 2D stencil
+- transpose-like access
+- triangular upper-region scaling
 
-The included tests can serve as functional microbenchmarks, while full Polybench kernels are better for performance measurements.
+These are built as standalone executables so they can be profiled directly with `perf`.
 
-### Metrics
+## Baselines
 
-Measure:
+Every benchmark is built in three variants:
 
-- L1 data cache misses
-- L2 data cache misses
-- total runtime
-- speedup relative to baseline
+- `raw`: original kernel, no LICM or polyhedral pass
+- `licm`: original kernel after `mem2reg`, `loop-simplify`, and `licm`
+- `poly`: original kernel after `mem2reg`, `loop-simplify`, `licm`, and `polyhedral-pass`
 
-On Linux, hardware counter collection can be done with `perf`, for example:
+This gives the two required baselines:
 
-```bash
-perf stat -e cache-references,cache-misses,L1-dcache-load-misses ./benchmark
+- untransformed code
+- LICM-only code
+
+and a third comparison point for the polyhedral transformation itself.
+
+## Metrics
+
+The analysis scripts report:
+
+- interpreted instruction count
+- elapsed runtime
+- L1 data cache load misses
+- total cache misses
+- speedup of `poly` relative to `raw`
+- speedup of `poly` relative to `licm`
+
+`cache-misses` is used as the portable second-level cache proxy in the provided scripts because exact L2 event names vary across machines.
+
+## Tile-Size Sensitivity Study
+
+Tiled benchmarks use the compile-time parameter:
+
+```text
+TILE_SIZE
 ```
 
-### Sensitivity study
+The sweep script rebuilds the benchmark suite for several tile sizes, records runtime and cache misses, and reports the best-performing tile per benchmark.
 
-For tiled kernels, sweep several tile sizes and report:
+## How To Run
 
-- cache miss rate vs. tile size
-- runtime vs. tile size
-- best-performing tile size per benchmark
-
-This demonstrates the locality/performance tradeoff and shows that larger tiles are not always better.
-
-## Expected Outcomes
-
-A successful submission should demonstrate:
-
-- correct identification of affine, perfectly nested loops
-- conservative legality checking based on dependence preservation
-- working loop interchange and loop tiling transformations
-- measurable locality improvements on at least some dense kernels
-- a clear discussion of cases where the pass declines to transform
-
-## Limitations
-
-This project intentionally stays small and educational. It is not a full polyhedral compiler. In particular, it does not include:
-
-- full schedule optimization
-- fusion or skewing
-- automatic cost-model-driven search over all schedules
-- sophisticated alias analysis beyond conservative checks
-
-## How to Run
-
-### Using Docker
-
-#### 1. Build the Docker image
+### Build the Docker image
 
 ```bash
 docker-compose build
 ```
 
-This builds the container with all required dependencies (LLVM, clang, perf tools).
-
-#### 2. Run the container
+### Start the container
 
 ```bash
-docker-compose run --rm work
+docker-compose run compiler-env
 ```
 
-This starts an interactive shell inside the container at `/work`, where the project is mounted.
-
-### Inside the container (or natively)
-
-#### Build the pass plugin
+### Build the pass
 
 ```bash
 make
 ```
 
-This compiles the polyhedral pass plugin (`polyhedralpass.so`).
-
-#### Build all test bitcode
+### Build the IR inspection tests
 
 ```bash
 make tests
 ```
 
-This compiles all test C files to LLVM bitcode (both m2r and opt versions).
+This generates:
 
-#### Run analysis targets
+- `build/tests/.../*-m2r.ll`
+- `build/tests/.../*-opt.ll`
 
-**Compare instruction counts (m2r vs opt):**
+### Build the benchmark baselines
+
+```bash
+make benchmarks
+```
+
+This produces executables and bitcode under:
+
+```text
+build/benchmarks/tile-32/
+```
+
+### Compare instruction counts
 
 ```bash
 make analyze
 ```
 
-or run directly:
-
-```bash
-./scripts/lli-compare.sh
-```
-
-Output shows a table with instruction counts for each test case, comparing the m2r (untransformed) version against the opt (optimized) version.
-
-**Run perf-based cache analysis:**
+### Run runtime and cache profiling
 
 ```bash
 make perf
 ```
 
-This runs both the instruction comparison and cache miss analysis, showing:
-- L1 data cache miss percentages
-- dTLB miss percentages
-
-#### Run standalone scripts
-
-Both analysis scripts can also be executed directly:
+### Sweep tile sizes
 
 ```bash
-./scripts/lli-compare.sh
-./scripts/perf-profile.sh
+make sweep
 ```
 
-#### Clean build artifacts
+You can also choose a tile size manually:
 
 ```bash
-make clean
+make benchmarks TILE_SIZE=64
+make analyze TILE_SIZE=64
+make perf TILE_SIZE=64
 ```
 
-Both scripts are hardcoded to analyze bitcode files in `./build/tests/polyhedral-pass/`.
+## Expected Outcomes
 
-## Deliverables
+A successful run should demonstrate:
 
-The final project should include:
+- correct identification of affine, perfectly nested loops
+- conservative legality checking based on dependence preservation
+- loop interchange on transpose-like kernels
+- loop tiling on stencil-, convolution-, triangular-, and matrix-multiply-style kernels
+- measurable locality improvements on at least some dense kernels
+- explicit rejection of unsafe same-base dependence patterns
 
-- the LLVM pass implementation
-- a short explanation of the legality analysis
-- transformed examples or IR before/after snapshots
-- performance data for the chosen kernels
-- a brief discussion of tile-size sensitivity and observed cache behavior
+## Limitations
+
+This is still a small educational project, not a full polyhedral optimizer. In particular, it does not include:
+
+- full schedule synthesis
+- arbitrary IR-level loop reconstruction from dependence polyhedra
+- fusion, skewing, or Pluto-style search
+- aggressive alias reasoning
+- automatic transformed helper generation
+
+For now, the pass only rewrites functions that have a matching `__poly_ref_*` transformed helper in the same module. Unsupported functions are analyzed and reported, but left unchanged.
