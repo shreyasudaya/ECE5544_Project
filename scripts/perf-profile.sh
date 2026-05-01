@@ -1,50 +1,82 @@
 #!/bin/bash
 
-PERF_CMD="perf"
 TARGET_DIR="./build/tests/polyhedral-pass"
 
-# Hardware events specifically chosen for Polyhedral Pass analysis
-# L1-dcache: Shows if tiling/interchange improved spatial locality
-# LLC: Shows if the problem size fits in cache or is hitting RAM
-# dTLB: Shows if memory access patterns are predictable
-PERF_EVENTS="L1-dcache-loads,L1-dcache-load-misses,LLC-loads,LLC-load-misses,dTLB-loads,dTLB-load-misses"
+HARDWARE_EVENTS="cache-references,cache-misses,instructions,cycles"
+
+CHECK=$(perf stat -e $HARDWARE_EVENTS true 2>&1)
+
+USE_PERF=1
+if echo "$CHECK" | grep -q "not supported"; then
+    USE_PERF=0
+fi
 
 echo ""
-echo "╔════════════════════╦══════════════════╦══════════════════╦═══════════════╦═══════════════╗"
-printf "║ %-18s ║ %16s ║ %16s ║ %13s ║ %13s ║\n" "Test" "L1-dcache (m2r)" "L1-dcache (opt)" "dTLB (m2r)" "dTLB (opt)"
-echo "╠════════════════════╬══════════════════╬══════════════════╬═══════════════╬═══════════════╣"
+echo "════════════════════════════════════════════"
+echo " Polyhedral Benchmark (Robust Mode)"
+echo " Mode: $([ $USE_PERF -eq 1 ] && echo PERF || echo RUNTIME)"
+echo "════════════════════════════════════════════"
+echo ""
 
-# Process bitcode files
+printf "║ %-18s ║ %-12s ║ %-12s ║\n" "Test" "Baseline" "Optimized"
+echo "════════════════════════════════════════════"
+
 find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
+
     prefix="${base_bc%-m2r.bc}"
     opt_bc="${prefix}-opt.bc"
-    display_name=$(basename "$prefix")
+    name=$(basename "$prefix")
 
-    if [ ! -f "$opt_bc" ]; then
-        continue
+    [ ! -f "$opt_bc" ] && continue
+
+    if [ $USE_PERF -eq 1 ]; then
+
+        m2r_out=$(perf stat -e $HARDWARE_EVENTS lli "$base_bc" 2>&1)
+        opt_out=$(perf stat -e $HARDWARE_EVENTS lli "$opt_bc" 2>&1)
+
+        get() {
+            echo "$1" | grep "$2" | awk '{print $1}' | tr -d ','
+        }
+
+        m2r_refs=$(get "$m2r_out" "cache-references")
+        m2r_miss=$(get "$m2r_out" "cache-misses")
+
+        opt_refs=$(get "$opt_out" "cache-references")
+        opt_miss=$(get "$opt_out" "cache-misses")
+
+        m2r_refs=${m2r_refs:-1}
+        opt_refs=${opt_refs:-1}
+
+        m2r_pct=$(awk "BEGIN {printf \"%.2f\", ($m2r_miss/$m2r_refs)*100}")
+        opt_pct=$(awk "BEGIN {printf \"%.2f\", ($opt_miss/$opt_refs)*100}")
+
+        printf "║ %-18s ║ %10s%% ║ %10s%% ║\n" "$name" "$m2r_pct" "$opt_pct"
+
+    else
+
+        # -------- RUNTIME MODE (NO /usr/bin/time) --------
+
+        start1=$(date +%s.%N)
+        lli "$base_bc" > /dev/null 2>&1
+        end1=$(date +%s.%N)
+
+        start2=$(date +%s.%N)
+        lli "$opt_bc" > /dev/null 2>&1
+        end2=$(date +%s.%N)
+
+        m2r_time=$(awk "BEGIN {print $end1 - $start1}")
+        opt_time=$(awk "BEGIN {print $end2 - $start2}")
+
+        speedup=$(awk "BEGIN {
+            if ($opt_time > 0) printf \"%.2f\", $m2r_time / $opt_time;
+            else print \"0\"
+        }")
+
+        printf "║ %-18s ║ %10ss ║ %10ss ║\n" "$name" "$m2r_time" "$opt_time"
+        printf "║ %-18s ║ %-10s ║ %-10s ║\n" "" "speedup:" "$speedup"
     fi
 
-    # Run perf and extract counts
-    m2r_output=$($PERF_CMD stat -e "$PERF_EVENTS" lli "$base_bc" 2>&1)
-    opt_output=$($PERF_CMD stat -e "$PERF_EVENTS" lli "$opt_bc" 2>&1)
-    
-    m2r_l1dcload=$(echo "$m2r_output" | grep "L1-dcache-loads" | awk '{print $1}' | tr -d ',')
-    opt_l1dcload=$(echo "$opt_output" | grep "L1-dcache-loads" | awk '{print $1}' | tr -d ',')
-    m2r_l1dcmiss=$(echo "$m2r_output" | grep "L1-dcache-load-misses" | awk '{print $1}' | tr -d ',')
-    opt_l1dcmiss=$(echo "$opt_output" | grep "L1-dcache-load-misses" | awk '{print $1}' | tr -d ',')
-    m2r_dtlbload=$(echo "$m2r_output" | grep "dTLB-loads" | awk '{print $1}' | tr -d ',')
-    opt_dtlbload=$(echo "$opt_output" | grep "dTLB-loads" | awk '{print $1}' | tr -d ',')
-    m2r_dtlbmiss=$(echo "$m2r_output" | grep "dTLB-load-misses" | awk '{print $1}' | tr -d ',')
-    opt_dtlbmiss=$(echo "$opt_output" | grep "dTLB-load-misses" | awk '{print $1}' | tr -d ',')
-    
-    # Calculate and output miss percentages directly
-    m2r_l1pct=$(awk "BEGIN {printf \"%.2f\", ($m2r_l1dcmiss / $m2r_l1dcload) * 100}")
-    opt_l1pct=$(awk "BEGIN {printf \"%.2f\", ($opt_l1dcmiss / $opt_l1dcload) * 100}")
-    m2r_dtlbpct=$(awk "BEGIN {printf \"%.2f\", ($m2r_dtlbmiss / $m2r_dtlbload) * 100}")
-    opt_dtlbpct=$(awk "BEGIN {printf \"%.2f\", ($opt_dtlbmiss / $opt_dtlbload) * 100}")
-    
-    printf "║ %-18s ║ %15s%% ║ %15s%% ║ %12s%% ║ %12s%% ║\n" "$display_name" "$m2r_l1pct" "$opt_l1pct" "$m2r_dtlbpct" "$opt_dtlbpct"
 done
 
-echo "╚════════════════════╩══════════════════╩══════════════════╩═══════════════╩═══════════════╝"
+echo "════════════════════════════════════════════"
 echo ""

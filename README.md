@@ -1,3 +1,5 @@
+convert shell scripts 
+sed -i 's/\r$//' ./scripts/*.sh
 # Polyhedral Loop Transformations for Cache Locality
 
 ## Overview
