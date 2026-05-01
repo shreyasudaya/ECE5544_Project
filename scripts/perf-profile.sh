@@ -1,82 +1,101 @@
 #!/bin/bash
 
-TARGET_DIR="./build/tests/polyhedral-pass"
+TARGET_DIR="./build/benchmarks"
+HARDWARE_EVENTS="cache-references,cache-misses"
 
-HARDWARE_EVENTS="cache-references,cache-misses,instructions,cycles"
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Error: '$TARGET_DIR' is not a valid directory."
+    exit 1
+fi
 
 CHECK=$(perf stat -e $HARDWARE_EVENTS true 2>&1)
 
 USE_PERF=1
-if echo "$CHECK" | grep -q "not supported"; then
+if echo "$CHECK" | grep -Eqi "not supported|no permission|permission denied|cannot find"; then
     USE_PERF=0
 fi
 
+runtime_of() {
+    local bc_file="$1"
+    local start end
+    start=$(date +%s.%N)
+    lli "$bc_file" >/dev/null 2>&1
+    end=$(date +%s.%N)
+    awk "BEGIN {printf \"%.5f\", $end - $start}"
+}
+
+speedup_of() {
+    local base="$1"
+    local candidate="$2"
+    awk "BEGIN {if ($candidate > 0) printf \"%.2fx\", $base / $candidate; else print \"n/a\"}"
+}
+
+cache_pct_of() {
+    local bc_file="$1"
+    local out refs misses
+    out=$(perf stat -e $HARDWARE_EVENTS lli "$bc_file" 2>&1 >/dev/null)
+    refs=$(echo "$out" | grep "cache-references" | awk '{print $1}' | tr -d ',' | head -n 1)
+    misses=$(echo "$out" | grep "cache-misses" | awk '{print $1}' | tr -d ',' | head -n 1)
+    if ! [[ "$refs" =~ ^[0-9]+$ ]] || ! [[ "$misses" =~ ^[0-9]+$ ]]; then
+        printf "n/a"
+    elif [ "$refs" -gt 0 ]; then
+        awk "BEGIN {printf \"%.2f%%\", ($misses / $refs) * 100}"
+    else
+        printf "n/a"
+    fi
+}
+
 echo ""
-echo "════════════════════════════════════════════"
-echo " Polyhedral Benchmark (Robust Mode)"
-echo " Mode: $([ $USE_PERF -eq 1 ] && echo PERF || echo RUNTIME)"
-echo "════════════════════════════════════════════"
+echo "Mode: $([ $USE_PERF -eq 1 ] && echo PERF || echo RUNTIME)"
 echo ""
 
-printf "║ %-18s ║ %-12s ║ %-12s ║\n" "Test" "Baseline" "Optimized"
-echo "════════════════════════════════════════════"
+if [ $USE_PERF -eq 1 ]; then
+    printf "%-18s %12s %12s %12s %12s\n" \
+        "Benchmark" "raw miss%" "licm miss%" "lcm miss%" "poly miss%"
+    printf "%-18s %12s %12s %12s %12s\n" \
+        "------------------" "------------" "------------" "------------" "------------"
+else
+    printf "%-18s %10s %10s %10s %10s %10s %10s %10s\n" \
+        "Benchmark" "raw(s)" "licm(s)" "lcm(s)" "poly(s)" \
+        "p/raw" "p/licm" "p/lcm"
+    printf "%-18s %10s %10s %10s %10s %10s %10s %10s\n" \
+        "------------------" "--------" "--------" "--------" "--------" \
+        "--------" "--------" "--------"
+fi
 
-find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
-
-    prefix="${base_bc%-m2r.bc}"
-    opt_bc="${prefix}-opt.bc"
+find "$TARGET_DIR" -maxdepth 1 -name "*-raw.bc" | sort | while read -r raw_bc; do
+    prefix="${raw_bc%-raw.bc}"
+    licm_bc="${prefix}-licm.bc"
+    lcm_bc="${prefix}-lcm.bc"
+    poly_bc="${prefix}-poly.bc"
     name=$(basename "$prefix")
 
-    [ ! -f "$opt_bc" ] && continue
+    [ ! -f "$licm_bc" ] && continue
+    [ ! -f "$lcm_bc" ] && continue
+    [ ! -f "$poly_bc" ] && continue
 
     if [ $USE_PERF -eq 1 ]; then
+        raw_pct=$(cache_pct_of "$raw_bc")
+        licm_pct=$(cache_pct_of "$licm_bc")
+        lcm_pct=$(cache_pct_of "$lcm_bc")
+        poly_pct=$(cache_pct_of "$poly_bc")
 
-        m2r_out=$(perf stat -e $HARDWARE_EVENTS lli "$base_bc" 2>&1)
-        opt_out=$(perf stat -e $HARDWARE_EVENTS lli "$opt_bc" 2>&1)
-
-        get() {
-            echo "$1" | grep "$2" | awk '{print $1}' | tr -d ','
-        }
-
-        m2r_refs=$(get "$m2r_out" "cache-references")
-        m2r_miss=$(get "$m2r_out" "cache-misses")
-
-        opt_refs=$(get "$opt_out" "cache-references")
-        opt_miss=$(get "$opt_out" "cache-misses")
-
-        m2r_refs=${m2r_refs:-1}
-        opt_refs=${opt_refs:-1}
-
-        m2r_pct=$(awk "BEGIN {printf \"%.2f\", ($m2r_miss/$m2r_refs)*100}")
-        opt_pct=$(awk "BEGIN {printf \"%.2f\", ($opt_miss/$opt_refs)*100}")
-
-        printf "║ %-18s ║ %10s%% ║ %10s%% ║\n" "$name" "$m2r_pct" "$opt_pct"
-
+        printf "%-18s %12s %12s %12s %12s\n" \
+            "$name" "$raw_pct" "$licm_pct" "$lcm_pct" "$poly_pct"
     else
+        raw_time=$(runtime_of "$raw_bc")
+        licm_time=$(runtime_of "$licm_bc")
+        lcm_time=$(runtime_of "$lcm_bc")
+        poly_time=$(runtime_of "$poly_bc")
 
-        # -------- RUNTIME MODE (NO /usr/bin/time) --------
+        p_raw=$(speedup_of "$raw_time" "$poly_time")
+        p_licm=$(speedup_of "$licm_time" "$poly_time")
+        p_lcm=$(speedup_of "$lcm_time" "$poly_time")
 
-        start1=$(date +%s.%N)
-        lli "$base_bc" > /dev/null 2>&1
-        end1=$(date +%s.%N)
-
-        start2=$(date +%s.%N)
-        lli "$opt_bc" > /dev/null 2>&1
-        end2=$(date +%s.%N)
-
-        m2r_time=$(awk "BEGIN {print $end1 - $start1}")
-        opt_time=$(awk "BEGIN {print $end2 - $start2}")
-
-        speedup=$(awk "BEGIN {
-            if ($opt_time > 0) printf \"%.2f\", $m2r_time / $opt_time;
-            else print \"0\"
-        }")
-
-        printf "║ %-18s ║ %10ss ║ %10ss ║\n" "$name" "$m2r_time" "$opt_time"
-        printf "║ %-18s ║ %-10s ║ %-10s ║\n" "" "speedup:" "$speedup"
+        printf "%-18s %10s %10s %10s %10s %10s %10s %10s\n" \
+            "$name" "$raw_time" "$licm_time" "$lcm_time" "$poly_time" \
+            "$p_raw" "$p_licm" "$p_lcm"
     fi
-
 done
 
-echo "════════════════════════════════════════════"
 echo ""

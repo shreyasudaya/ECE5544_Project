@@ -11,6 +11,7 @@ LDFLAGS      = $(shell $(LLVM_CONFIG) --ldflags | tr '\n' ' ') -Wl,--exclude-lib
 BUILDDIR     = build
 DEPDIR       = $(BUILDDIR)/.deps
 TESTDIR      = $(BUILDDIR)/tests
+BENCHDIR     = $(BUILDDIR)/benchmarks
 
 # --- Pass/Plugin ---
 # Ensure this matches your .cpp filename exactly!
@@ -18,27 +19,39 @@ OPTIMIZER_SOURCES = polyhedralpass.cpp
 OPTIMIZER_LIBS    = $(OPTIMIZER_SOURCES:%.cpp=$(BUILDDIR)/%.so)
 
 # --- Tests ---
-TEST_SRCS    = $(wildcard tests/*/*.c)
+TEST_SRCS    = $(wildcard tests/polyhedral-pass/*.c)
 TESTS        = $(TEST_SRCS:tests/%.c=%)
 TESTS_PRE    = $(TESTS:%=$(TESTDIR)/%-m2r.ll)
-TESTS_OUT    = $(TESTS:%=$(TESTDIR)/%-opt.ll)
+TESTS_POLY   = $(TESTS:%=$(TESTDIR)/%-poly.ll)
+TESTS_LICM   = $(TESTS:%=$(TESTDIR)/%-licm.ll)
+TESTS_LCM    = $(TESTS:%=$(TESTDIR)/%-lcm.ll)
+
+# --- Benchmarks ---
+BENCH_SRCS   = $(wildcard tests/benchmarks/*.c)
+BENCHES      = $(BENCH_SRCS:tests/benchmarks/%.c=%)
+BENCH_RAW    = $(BENCHES:%=$(BENCHDIR)/%-raw.bc)
+BENCH_POLY   = $(BENCHES:%=$(BENCHDIR)/%-poly.bc)
+BENCH_LICM   = $(BENCHES:%=$(BENCHDIR)/%-licm.bc)
+BENCH_LCM    = $(BENCHES:%=$(BENCHDIR)/%-lcm.bc)
 
 # --- Dependency Management ---
 DEPFLAGS     = -MT $@ -MMD -MP -MF $(DEPDIR)/$*.d
 DEPFILES     = $(OPTIMIZER_SOURCES:%.cpp=$(DEPDIR)/%.d)
 
-.PHONY: clean tests analyze perf
+.PHONY: clean tests benchmarks analyze perf
 .SECONDARY: # This ensures Make doesn't delete your intermediate .bc files
 
 $(OPTIMIZER_LIBS): # Default target - builds the pass plugin
 
-tests: $(TESTS_PRE) $(TESTS_OUT)
+tests: $(TESTS_PRE) $(TESTS_POLY) $(TESTS_LICM) $(TESTS_LCM)
 
-analyze: $(OPTIMIZER_LIBS) tests
+benchmarks: $(BENCH_RAW) $(BENCH_POLY) $(BENCH_LICM) $(BENCH_LCM)
+
+analyze: $(OPTIMIZER_LIBS) benchmarks
 	@echo "\n========== Running Analysis =========="
 	./scripts/lli-compare.sh
 
-perf: $(OPTIMIZER_LIBS) tests
+perf: $(OPTIMIZER_LIBS) benchmarks
 	@echo "\n========== Running LLI Comparison =========="
 	./scripts/lli-compare.sh
 	@echo "\n========== Running Perf Analysis =========="
@@ -59,7 +72,7 @@ $(BUILDDIR)/%.so: $(BUILDDIR)/%.o
 # Step A: C -> Raw Bitcode (Allocas/Loads/Stores)
 $(TESTDIR)/%.bc: tests/%.c
 	@mkdir -p $(dir $@)
-	clang -O0 -Xclang -disable-O0-optnone -fno-discard-value-names -emit-llvm -c $< -o $@
+	clang -O0 -ffp-contract=off -Xclang -disable-O0-optnone -fno-discard-value-names -emit-llvm -c $< -o $@
 
 # Step B: Raw Bitcode -> SSA Bitcode (Virtual Registers & PHI nodes)
 # This uses the built-in mem2reg pass
@@ -68,13 +81,28 @@ $(TESTDIR)/%-m2r.bc: $(TESTDIR)/%.bc
 	opt -passes=mem2reg,loop-simplify $< -o $@
 
 # Step C: SSA Bitcode -> Optimized Bitcode (Running your Plugin)
-$(TESTDIR)/%-opt.bc: $(TESTDIR)/%-m2r.bc $(OPTIMIZER_LIBS)
+$(TESTDIR)/%-poly.bc: $(TESTDIR)/%-m2r.bc $(OPTIMIZER_LIBS)
 	@mkdir -p $(dir $@)
-	$(eval PASS := $(patsubst %/,%,$(dir $*)))
-	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='$(PASS)' $< -o $@
+	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='function(polyhedral-pass)' $< -o $@
+
+$(TESTDIR)/%-licm.bc: $(TESTDIR)/%-m2r.bc
+	@mkdir -p $(dir $@)
+	opt -passes='function(loop-mssa(licm))' $< -o $@
+
+$(TESTDIR)/%-lcm.bc: $(TESTDIR)/%-m2r.bc
+	@mkdir -p $(dir $@)
+	opt -passes='function(gvn<pre>)' $< -o $@
 
 # Step D: Bitcode -> Human Readable IR (.ll files)
-$(TESTDIR)/%-opt.ll: $(TESTDIR)/%-opt.bc
+$(TESTDIR)/%-poly.ll: $(TESTDIR)/%-poly.bc
+	@mkdir -p $(dir $@)
+	llvm-dis $< -o $@
+
+$(TESTDIR)/%-licm.ll: $(TESTDIR)/%-licm.bc
+	@mkdir -p $(dir $@)
+	llvm-dis $< -o $@
+
+$(TESTDIR)/%-lcm.ll: $(TESTDIR)/%-lcm.bc
 	@mkdir -p $(dir $@)
 	llvm-dis $< -o $@
 
@@ -82,8 +110,29 @@ $(TESTDIR)/%-m2r.ll: $(TESTDIR)/%-m2r.bc
 	@mkdir -p $(dir $@)
 	llvm-dis $< -o $@
 
+# --- 3. Benchmark Pipeline ---
+$(BENCHDIR)/%.bc: tests/benchmarks/%.c
+	@mkdir -p $(dir $@)
+	clang -O0 -ffp-contract=off -Xclang -disable-O0-optnone -fno-discard-value-names -emit-llvm -c $< -o $@
+
+$(BENCHDIR)/%-raw.bc: $(BENCHDIR)/%.bc
+	@mkdir -p $(dir $@)
+	opt -passes=mem2reg,loop-simplify $< -o $@
+
+$(BENCHDIR)/%-poly.bc: $(BENCHDIR)/%-raw.bc $(OPTIMIZER_LIBS)
+	@mkdir -p $(dir $@)
+	opt $(OPTIMIZER_LIBS:%=-load-pass-plugin=%) -passes='function(polyhedral-pass)' $< -o $@
+
+$(BENCHDIR)/%-licm.bc: $(BENCHDIR)/%-raw.bc
+	@mkdir -p $(dir $@)
+	opt -passes='function(loop-mssa(licm))' $< -o $@
+
+$(BENCHDIR)/%-lcm.bc: $(BENCHDIR)/%-raw.bc
+	@mkdir -p $(dir $@)
+	opt -passes='function(gvn<pre>)' $< -o $@
+
 # --- Helpers ---
-$(DEPDIR) $(BUILDDIR) $(TESTDIR):
+$(DEPDIR) $(BUILDDIR) $(TESTDIR) $(BENCHDIR):
 	@mkdir -p $@
 
 -include $(wildcard $(DEPFILES))

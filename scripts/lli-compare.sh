@@ -1,66 +1,65 @@
 #!/bin/bash
 
-TARGET_DIR="./build/tests/polyhedral-pass"
+TARGET_DIR="./build/benchmarks"
 
-# Check if the provided path is actually a directory
 if [ ! -d "$TARGET_DIR" ]; then
     echo "Error: '$TARGET_DIR' is not a valid directory."
     exit 1
 fi
 
+instr_count() {
+    local bc_file="$1"
+    local stats
+    stats=$(lli -stats -force-interpreter "$bc_file" 2>&1 >/dev/null)
+    echo "$stats" | grep "instructions executed" | awk '{print $1}' | tr -d ',' | head -n 1
+}
+
+percent_diff() {
+    local base="$1"
+    local candidate="$2"
+    if [ "$base" -gt 0 ]; then
+        awk "BEGIN {printf \"%.2f\", (($base - $candidate) / $base) * 100}"
+    else
+        printf "n/a"
+    fi
+}
+
 echo ""
-echo "╔════════════════════╦═══════════════════╦═══════════════════╦═══════════════════╗"
-printf "║ %-18s ║ %17s ║ %17s ║ %17s ║\n" "Test" "m2r (instr)" "opt (instr)" "Diff (%)"
-echo "╠════════════════════╬═══════════════════╬═══════════════════╬═══════════════════╣"
+printf "%-18s %14s %14s %14s %14s %12s %12s %12s\n" \
+    "Benchmark" "raw instr" "licm instr" "lcm instr" "poly instr" \
+    "poly/raw%" "poly/licm%" "poly/lcm%"
+printf "%-18s %14s %14s %14s %14s %12s %12s %12s\n" \
+    "------------------" "--------------" "--------------" "--------------" "--------------" \
+    "------------" "------------" "------------"
 
-# Find all files ending in -m2r.bc
-find "$TARGET_DIR" -maxdepth 1 -name "*-m2r.bc" | sort | while read -r base_bc; do
-    
-    # Identify the prefix (everything before -m2r.bc)
-    prefix="${base_bc%-m2r.bc}"
-    opt_bc="${prefix}-opt.bc"
-    
-    # Extract clean filename for display
-    display_name=$(basename "$prefix")
+find "$TARGET_DIR" -maxdepth 1 -name "*-raw.bc" | sort | while read -r raw_bc; do
+    prefix="${raw_bc%-raw.bc}"
+    licm_bc="${prefix}-licm.bc"
+    lcm_bc="${prefix}-lcm.bc"
+    poly_bc="${prefix}-poly.bc"
+    name=$(basename "$prefix")
 
-    # Check if the optimized counterpart exists
-    if [ ! -f "$opt_bc" ]; then
-        continue
-    fi
+    [ ! -f "$licm_bc" ] && continue
+    [ ! -f "$lcm_bc" ] && continue
+    [ ! -f "$poly_bc" ] && continue
 
-    # Run lli with interpreter and stats
-    # 2>&1 merges stderr (where stats live) into stdout so we can grep it
-    m2r_stats=$(lli -stats -force-interpreter "$base_bc" 2>&1 >/dev/null)
-    opt_stats=$(lli -stats -force-interpreter "$opt_bc" 2>&1 >/dev/null)
+    raw_count=$(instr_count "$raw_bc")
+    licm_count=$(instr_count "$licm_bc")
+    lcm_count=$(instr_count "$lcm_bc")
+    poly_count=$(instr_count "$poly_bc")
 
-    # Extract the digit count
-    m2r_count=$(echo "$m2r_stats" | grep "instructions executed" | awk '{print $1}' | tr -d ',')
-    opt_count=$(echo "$opt_stats" | grep "instructions executed" | awk '{print $1}' | tr -d ',')
+    raw_count=${raw_count:-0}
+    licm_count=${licm_count:-0}
+    lcm_count=${lcm_count:-0}
+    poly_count=${poly_count:-0}
 
-    # Default to 0 if extraction fails
-    m2r_count=${m2r_count:-0}
-    opt_count=${opt_count:-0}
+    poly_raw=$(percent_diff "$raw_count" "$poly_count")
+    poly_licm=$(percent_diff "$licm_count" "$poly_count")
+    poly_lcm=$(percent_diff "$lcm_count" "$poly_count")
 
-    # Calculate difference (positive means opt is better/smaller)
-    diff=$((m2r_count - opt_count))
-
-    # Calculate percentage using awk for float precision, avoiding divide-by-zero
-    if [ "$m2r_count" -gt 0 ] && [ "$diff" -gt 0 ]; then
-        percent=$(awk "BEGIN {printf \"%.2f\", ($diff / $m2r_count) * 100}")
-        diff_display="${diff} (+${percent}%)"
-    else
-        diff_display="${diff}"
-    fi
-
-    # Colorize the output: Red if opt is higher (regression), Green if lower
-    if [ "$diff" -lt 0 ]; then
-        # Red text for regression
-        printf "║ %-18s ║ %17s ║ %17s ║ \e[31m%17s\e[0m ║\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
-    else
-        # Green text for improvement
-        printf "║ %-18s ║ %17s ║ %17s ║ \e[32m%17s\e[0m ║\n" "$display_name" "$m2r_count" "$opt_count" "$diff_display"
-    fi
+    printf "%-18s %14s %14s %14s %14s %12s %12s %12s\n" \
+        "$name" "$raw_count" "$licm_count" "$lcm_count" "$poly_count" \
+        "$poly_raw" "$poly_licm" "$poly_lcm"
 done
 
-echo "╚════════════════════╩═══════════════════╩═══════════════════╩═══════════════════╝"
 echo ""

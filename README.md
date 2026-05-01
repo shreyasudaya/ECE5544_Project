@@ -238,6 +238,7 @@ The current test set already contains several useful cases:
 
 - untransformed loop nest
 - LICM-optimized version from the earlier homework
+- LCM-style PRE baseline using `gvn<pre>`
 
 ### Benchmarks
 
@@ -330,11 +331,24 @@ This compiles the polyhedral pass plugin (`polyhedralpass.so`).
 make tests
 ```
 
-This compiles all test C files to LLVM bitcode (both m2r and opt versions).
+This compiles the micro-test C files to LLVM bitcode for four variants:
+
+- `m2r`: mem2reg baseline
+- `poly`: the custom polyhedral pass
+- `licm`: LLVM LICM baseline
+- `lcm`: LLVM PRE/GVN baseline
+
+#### Build runnable benchmark bitcode
+
+```bash
+make benchmarks
+```
+
+This compiles runnable benchmark kernels used by the comparison scripts.
 
 #### Run analysis targets
 
-**Compare instruction counts (m2r vs opt):**
+**Compare instruction counts (raw vs licm vs lcm vs poly):**
 
 ```bash
 make analyze
@@ -346,7 +360,7 @@ or run directly:
 ./scripts/lli-compare.sh
 ```
 
-Output shows a table with instruction counts for each test case, comparing the m2r (untransformed) version against the opt (optimized) version.
+Output shows a four-way table for the runnable benchmark set, comparing the raw baseline against LICM, LCM, and the custom polyhedral pass.
 
 **Run perf-based cache analysis:**
 
@@ -354,9 +368,10 @@ Output shows a table with instruction counts for each test case, comparing the m
 make perf
 ```
 
-This runs both the instruction comparison and cache miss analysis, showing:
-- L1 data cache miss percentages
-- dTLB miss percentages
+This runs both the instruction comparison and performance analysis, showing either:
+
+- cache-miss percentages when `perf` counters are available, or
+- wall-clock runtime when hardware counters are unavailable
 
 #### Run standalone scripts
 
@@ -373,7 +388,7 @@ Both analysis scripts can also be executed directly:
 make clean
 ```
 
-Both scripts are hardcoded to analyze bitcode files in `./build/tests/polyhedral-pass/`.
+Both scripts analyze runnable benchmark bitcode in `./build/benchmarks/`.
 
 ## Deliverables
 
