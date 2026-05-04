@@ -1,19 +1,28 @@
 #include <algorithm>
+#include <cmath>
+#include <cctype>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <isl/ctx.h>
+#include <isl/map.h>
+#include <isl/set.h>
+#include <isl/union_map.h>
+#include <isl/union_set.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/Analysis/AliasAnalysis.h>
 #include <llvm/Analysis/AssumptionCache.h>
-#include <llvm/Analysis/DependenceAnalysis.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/Analysis/LoopNestAnalysis.h>
 #include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/IR/BasicBlock.h>
@@ -29,7 +38,6 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Transforms/Scalar/LoopPassManager.h>
-#include <llvm/Transforms/Utils/UnrollLoop.h>
 
 using namespace llvm;
 
@@ -47,9 +55,25 @@ cl::opt<bool> PolyEnableBlocking(
     cl::desc("Enable the blocking stage after affine legality checks"),
     cl::init(true));
 
+cl::opt<bool> PolyEnableInterchange(
+    "poly-enable-interchange",
+    cl::desc("Enable loop interchange to maximize locality before tiling"),
+    cl::init(true));
+
+// --------------------------------------------------------------------------
+// Phase 1: Affine Modeling & SCEV Integration
+// --------------------------------------------------------------------------
+
 struct AffineTerm {
   const Value *Symbol = nullptr;
   int64_t Coefficient = 0;
+};
+
+struct TileLoop {
+  BasicBlock *Header;
+  BasicBlock *Latch;
+  PHINode *Induction;
+  Value *NextIV;
 };
 
 struct AffineExpr {
@@ -61,18 +85,13 @@ struct AffineExpr {
   std::string str() const {
     std::string Buffer;
     raw_string_ostream OS(Buffer);
-
     bool Printed = false;
     if (Constant != 0 || Terms.empty()) {
       OS << Constant;
       Printed = true;
     }
-
     for (const AffineTerm &Term : Terms) {
-      if (Printed) {
-        OS << " + ";
-      }
-
+      if (Printed) OS << " + ";
       if (Term.Symbol != nullptr && Term.Symbol->hasName()) {
         OS << Term.Coefficient << "*" << Term.Symbol->getName();
       } else {
@@ -80,7 +99,6 @@ struct AffineExpr {
       }
       Printed = true;
     }
-
     return OS.str();
   }
 };
@@ -92,40 +110,18 @@ struct LoopBound {
 };
 
 struct MemoryAccess {
-  enum class Kind {
-    Load,
-    Store,
-  };
-
+  enum class Kind { Load, Store };
   Kind AccessKind = Kind::Load;
   Instruction *Inst = nullptr;
   const Value *BasePointer = nullptr;
   std::string BaseName;
   std::vector<AffineExpr> Subscripts;
-
-  std::string str() const {
-    std::string Buffer;
-    raw_string_ostream OS(Buffer);
-
-    OS << (AccessKind == Kind::Load ? "load" : "store") << " " << BaseName;
-    if (!Subscripts.empty()) {
-      OS << "[";
-      for (size_t I = 0; I < Subscripts.size(); ++I) {
-        if (I != 0) {
-          OS << ", ";
-        }
-        OS << Subscripts[I].str();
-      }
-      OS << "]";
-    }
-
-    return OS.str();
-  }
 };
 
 struct LoopDescriptor {
   Loop *LoopNode = nullptr;
   PHINode *Induction = nullptr;
+  Value *NextValue = nullptr; // Result of the loop increment
   std::string InductionName;
   LoopBound Bounds;
   Value *StartValue = nullptr;
@@ -143,38 +139,22 @@ struct LoopNestDescriptor {
 };
 
 std::string valueNameOrFallback(const Value *V, StringRef Prefix) {
-  if (V == nullptr) {
-    return Prefix.str();
-  }
-  if (V->hasName()) {
-    return std::string(V->getName());
-  }
-
+  if (V == nullptr) return Prefix.str();
+  if (V->hasName()) return std::string(V->getName());
   std::string Buffer;
   raw_string_ostream OS(Buffer);
   V->printAsOperand(OS, false);
   return OS.str();
 }
 
-std::optional<int64_t> getConstantIntValue(const Value *V) {
-  if (const auto *CI = dyn_cast_or_null<ConstantInt>(V)) {
-    return CI->getSExtValue();
-  }
-  return std::nullopt;
-}
-
 void addTerm(AffineExpr &Expr, const Value *Symbol, int64_t Coefficient) {
-  if (Coefficient == 0 || Symbol == nullptr) {
-    return;
-  }
-
+  if (Coefficient == 0 || Symbol == nullptr) return;
   for (AffineTerm &Term : Expr.Terms) {
     if (Term.Symbol == Symbol) {
       Term.Coefficient += Coefficient;
       return;
     }
   }
-
   Expr.Terms.push_back({Symbol, Coefficient});
 }
 
@@ -186,19 +166,6 @@ AffineExpr addExpr(const AffineExpr &LHS, const AffineExpr &RHS) {
     addTerm(Result, Term.Symbol, Term.Coefficient);
   }
   return Result;
-}
-
-AffineExpr negateExpr(const AffineExpr &Expr) {
-  AffineExpr Result;
-  Result.Constant = -Expr.Constant;
-  for (const AffineTerm &Term : Expr.Terms) {
-    addTerm(Result, Term.Symbol, -Term.Coefficient);
-  }
-  return Result;
-}
-
-AffineExpr subExpr(const AffineExpr &LHS, const AffineExpr &RHS) {
-  return addExpr(LHS, negateExpr(RHS));
 }
 
 AffineExpr mulExpr(const AffineExpr &Expr, int64_t Factor) {
@@ -216,81 +183,54 @@ AffineExpr makeUnknownExpr(const Value *V) {
   return Expr;
 }
 
-AffineExpr makeExprFromValue(const Value *V) {
-  if (const std::optional<int64_t> Constant = getConstantIntValue(V)) {
-    AffineExpr Expr;
-    Expr.Constant = *Constant;
+AffineExpr createExprFromSCEV(const SCEV *S, ScalarEvolution &SE) {
+  AffineExpr Expr;
+  if (!S) return Expr;
+
+  if (auto *Const = dyn_cast<SCEVConstant>(S)) {
+    Expr.Constant = Const->getAPInt().getSExtValue();
     return Expr;
   }
-
-  if (const auto *Cast = dyn_cast<CastInst>(V)) {
-    return makeExprFromValue(Cast->getOperand(0));
+  
+  if (auto *Add = dyn_cast<SCEVAddExpr>(S)) {
+    for (const SCEV *Op : Add->operands()) {
+      Expr = addExpr(Expr, createExprFromSCEV(Op, SE));
+    }
+    return Expr;
   }
-
-  if (const auto *BO = dyn_cast<BinaryOperator>(V)) {
-    const Value *Op0 = BO->getOperand(0);
-    const Value *Op1 = BO->getOperand(1);
-
-    switch (BO->getOpcode()) {
-    case Instruction::Add:
-      return addExpr(makeExprFromValue(Op0), makeExprFromValue(Op1));
-    case Instruction::Sub:
-      return subExpr(makeExprFromValue(Op0), makeExprFromValue(Op1));
-    case Instruction::Mul:
-      if (const std::optional<int64_t> C = getConstantIntValue(Op0)) {
-        return mulExpr(makeExprFromValue(Op1), *C);
+  
+  if (auto *Mul = dyn_cast<SCEVMulExpr>(S)) {
+    if (Mul->getNumOperands() == 2) {
+      if (auto *C = dyn_cast<SCEVConstant>(Mul->getOperand(0))) {
+        return mulExpr(createExprFromSCEV(Mul->getOperand(1), SE), C->getAPInt().getSExtValue());
       }
-      if (const std::optional<int64_t> C = getConstantIntValue(Op1)) {
-        return mulExpr(makeExprFromValue(Op0), *C);
+      if (auto *C = dyn_cast<SCEVConstant>(Mul->getOperand(1))) {
+        return mulExpr(createExprFromSCEV(Mul->getOperand(0), SE), C->getAPInt().getSExtValue());
       }
-      break;
-    default:
-      break;
     }
   }
 
-  return makeUnknownExpr(V);
-}
-
-bool exprMentionsSymbol(const AffineExpr &Expr, const Value *Symbol) {
-  return llvm::any_of(Expr.Terms, [&](const AffineTerm &Term) {
-    return Term.Symbol == Symbol && Term.Coefficient != 0;
-  });
-}
-
-bool exprEquals(const AffineExpr &LHS, const AffineExpr &RHS) {
-  AffineExpr Delta = subExpr(LHS, RHS);
-  if (Delta.Constant != 0) {
-    return false;
-  }
-
-  return llvm::all_of(Delta.Terms, [](const AffineTerm &Term) {
-    return Term.Coefficient == 0;
-  });
-}
-
-std::optional<unsigned> getConstantTripCount(const LoopDescriptor &LoopDesc) {
-  if (!LoopDesc.Bounds.Lower.isConstant() || !LoopDesc.Bounds.Upper.isConstant() ||
-      LoopDesc.Bounds.Step <= 0) {
-    return std::nullopt;
-  }
-
-  int64_t Span = LoopDesc.Bounds.Upper.Constant - LoopDesc.Bounds.Lower.Constant;
-  if (Span <= 0 || (Span % LoopDesc.Bounds.Step) != 0) {
-    return std::nullopt;
-  }
-
-  return static_cast<unsigned>(Span / LoopDesc.Bounds.Step);
-}
-
-int findSubscriptPosition(const MemoryAccess &Access, const Value *Symbol) {
-  for (int I = static_cast<int>(Access.Subscripts.size()) - 1; I >= 0; --I) {
-    if (exprMentionsSymbol(Access.Subscripts[static_cast<size_t>(I)], Symbol)) {
-      return I + 1;
+  if (auto *AddRec = dyn_cast<SCEVAddRecExpr>(S)) {
+    const Loop *L = AddRec->getLoop();
+    if (PHINode *IV = L->getCanonicalInductionVariable()) {
+      AffineExpr Start = createExprFromSCEV(AddRec->getStart(), SE);
+      AffineExpr Step = createExprFromSCEV(AddRec->getStepRecurrence(SE), SE);
+      if (Step.Terms.empty()) { 
+        AffineExpr IVExpr = makeUnknownExpr(IV);
+        return addExpr(Start, mulExpr(IVExpr, Step.Constant));
+      }
     }
   }
+  
+  if (auto *Cast = dyn_cast<SCEVCastExpr>(S)) {
+    return createExprFromSCEV(Cast->getOperand(), SE);
+  }
+  
+  if (auto *Unknown = dyn_cast<SCEVUnknown>(S)) {
+    return makeUnknownExpr(Unknown->getValue());
+  }
 
-  return 0;
+  return Expr;
 }
 
 struct FlattenedGEP {
@@ -298,113 +238,58 @@ struct FlattenedGEP {
   std::vector<AffineExpr> Subscripts;
 };
 
-FlattenedGEP flattenGEP(const Value *PointerOperand) {
+FlattenedGEP flattenGEP(const Value *PointerOperand, ScalarEvolution &SE) {
   if (const auto *GEP = dyn_cast<GetElementPtrInst>(PointerOperand)) {
-    FlattenedGEP Flattened = flattenGEP(GEP->getPointerOperand());
-    if (Flattened.BasePointer == nullptr) {
-      Flattened.BasePointer = GEP->getPointerOperand();
-    }
+    FlattenedGEP Flattened = flattenGEP(GEP->getPointerOperand(), SE);
+    if (Flattened.BasePointer == nullptr) Flattened.BasePointer = GEP->getPointerOperand();
     for (const Use &Index : GEP->indices()) {
-      Flattened.Subscripts.push_back(makeExprFromValue(Index.get()));
+      Flattened.Subscripts.push_back(createExprFromSCEV(SE.getSCEV(Index.get()), SE));
     }
     return Flattened;
   }
-
   FlattenedGEP Base;
   Base.BasePointer = PointerOperand;
   return Base;
 }
 
-std::optional<int64_t> getUnitStrideStep(PHINode *Induction, Loop *L) {
-  if (Induction == nullptr || L == nullptr) {
-    return std::nullopt;
-  }
-
-  BasicBlock *Latch = L->getLoopLatch();
-  if (Latch == nullptr) {
-    return std::nullopt;
-  }
-
-  Value *BackedgeValue = Induction->getIncomingValueForBlock(Latch);
-  auto *BO = dyn_cast_or_null<BinaryOperator>(BackedgeValue);
-  if (BO == nullptr) {
-    return std::nullopt;
-  }
-
-  if (BO->getOpcode() == Instruction::Add) {
-    if (BO->getOperand(0) == Induction) {
-      return getConstantIntValue(BO->getOperand(1));
-    }
-    if (BO->getOperand(1) == Induction) {
-      return getConstantIntValue(BO->getOperand(0));
-    }
-  }
-
-  if (BO->getOpcode() == Instruction::Sub && BO->getOperand(0) == Induction) {
-    if (const std::optional<int64_t> C = getConstantIntValue(BO->getOperand(1))) {
-      return -*C;
-    }
-  }
-
-  return std::nullopt;
-}
-
-std::optional<LoopDescriptor> buildLoopDescriptor(Loop &L) {
+std::optional<LoopDescriptor> buildLoopDescriptor(Loop &L, ScalarEvolution &SE) {
   LoopDescriptor Descriptor;
   Descriptor.LoopNode = &L;
 
   PHINode *Induction = L.getCanonicalInductionVariable();
-  if (Induction == nullptr) {
-    return std::nullopt;
-  }
+  if (!Induction) return std::nullopt;
 
   Descriptor.Induction = Induction;
   Descriptor.InductionName = valueNameOrFallback(Induction, "iv");
 
   BasicBlock *Preheader = L.getLoopPreheader();
   BasicBlock *Exiting = L.getExitingBlock();
-  if (Preheader == nullptr || Exiting == nullptr) {
-    return std::nullopt;
-  }
+  BasicBlock *Latch = L.getLoopLatch();
+  if (!Preheader || !Exiting || !Latch) return std::nullopt;
 
   Descriptor.StartValue = Induction->getIncomingValueForBlock(Preheader);
-  if (Descriptor.StartValue == nullptr) {
-    return std::nullopt;
-  }
-  Descriptor.Bounds.Lower = makeExprFromValue(Descriptor.StartValue);
+  Descriptor.NextValue = Induction->getIncomingValueForBlock(Latch);
+  if (!Descriptor.StartValue || !Descriptor.NextValue) return std::nullopt;
 
-  const std::optional<int64_t> Step = getUnitStrideStep(Induction, &L);
-  if (!Step) {
-    return std::nullopt;
-  }
-  Descriptor.Bounds.Step = *Step;
+  const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Induction));
+  if (!AR) return std::nullopt;
+  
+  Descriptor.Bounds.Lower = createExprFromSCEV(AR->getStart(), SE);
+  AffineExpr StepExpr = createExprFromSCEV(AR->getStepRecurrence(SE), SE);
+  if (!StepExpr.Terms.empty() || StepExpr.Constant <= 0) return std::nullopt;
+  Descriptor.Bounds.Step = StepExpr.Constant;
 
   auto *BI = dyn_cast<BranchInst>(Exiting->getTerminator());
-  if (BI == nullptr || !BI->isConditional()) {
-    return std::nullopt;
-  }
+  if (!BI || !BI->isConditional()) return std::nullopt;
 
   auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-  if (Cmp == nullptr) {
-    return std::nullopt;
-  }
-
-  if (Cmp->getOperand(0) != Induction) {
-    return std::nullopt;
-  }
-
-  switch (Cmp->getPredicate()) {
-  case ICmpInst::ICMP_SLT:
-  case ICmpInst::ICMP_ULT:
-    break;
-  default:
-    return std::nullopt;
-  }
+  if (!Cmp || Cmp->getOperand(0) != Induction) return std::nullopt;
 
   Descriptor.Compare = Cmp;
   Descriptor.Predicate = Cmp->getPredicate();
   Descriptor.BoundValue = Cmp->getOperand(1);
-  Descriptor.Bounds.Upper = makeExprFromValue(Descriptor.BoundValue);
+  Descriptor.Bounds.Upper = createExprFromSCEV(SE.getSCEV(Descriptor.BoundValue), SE);
+  
   return Descriptor;
 }
 
@@ -414,22 +299,18 @@ SmallVector<Loop *, 4> linearizePerfectNest(Loop &Root) {
   Result.push_back(Current);
 
   while (!Current->getSubLoops().empty()) {
-    if (Current->getSubLoops().size() != 1) {
-      break;
-    }
+    if (Current->getSubLoops().size() != 1) break;
     Loop *Child = Current->getSubLoops().front();
     Result.push_back(Child);
     Current = Child;
   }
-
   return Result;
 }
 
-std::vector<MemoryAccess> collectMemoryAccesses(Loop *Innermost) {
+std::vector<MemoryAccess> collectMemoryAccesses(ArrayRef<LoopDescriptor> Loops, ScalarEvolution &SE) {
   std::vector<MemoryAccess> Accesses;
-  if (Innermost == nullptr) {
-    return Accesses;
-  }
+  if (Loops.empty()) return Accesses;
+  Loop *Innermost = Loops.back().LoopNode;
 
   for (BasicBlock *BB : Innermost->blocks()) {
     for (Instruction &Inst : *BB) {
@@ -442,466 +323,436 @@ std::vector<MemoryAccess> collectMemoryAccesses(Loop *Innermost) {
       } else if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
         PointerOperand = Store->getPointerOperand();
         Kind = MemoryAccess::Kind::Store;
-      } else {
-        continue;
-      }
+      } else continue;
 
       MemoryAccess Access;
       Access.AccessKind = Kind;
       Access.Inst = &Inst;
 
-        FlattenedGEP Flattened = flattenGEP(PointerOperand);
-        Access.BasePointer = Flattened.BasePointer;
-        Access.BaseName = valueNameOrFallback(Access.BasePointer, "ptr");
-        Access.Subscripts = std::move(Flattened.Subscripts);
-
-        Accesses.push_back(std::move(Access));
-      }
+      FlattenedGEP Flattened = flattenGEP(PointerOperand, SE);
+      Access.BasePointer = Flattened.BasePointer;
+      Access.BaseName = valueNameOrFallback(Access.BasePointer, "ptr");
+      Access.Subscripts = std::move(Flattened.Subscripts);
+      Accesses.push_back(std::move(Access));
+    }
   }
-
   return Accesses;
 }
 
-std::vector<MemoryAccess>
-collectMemoryAccesses(ArrayRef<LoopDescriptor> Loops) {
-  if (Loops.empty()) {
-    return {};
-  }
-  return collectMemoryAccesses(Loops.back().LoopNode);
-}
-
-std::optional<LoopNestDescriptor> analyzeLoopNest(LoopNest &LN,
-                                                  ScalarEvolution &SE) {
-  SmallVector<Loop *, 4> PerfectLoops =
-      linearizePerfectNest(LN.getOutermostLoop());
-  if (PerfectLoops.size() < 2) {
-    return std::nullopt;
-  }
-
-  LoopNestDescriptor Descriptor;
-  for (Loop *LoopNode : PerfectLoops) {
-    std::optional<LoopDescriptor> LoopDesc = buildLoopDescriptor(*LoopNode);
-    if (!LoopDesc) {
-      return std::nullopt;
-    }
-    Descriptor.Loops.push_back(std::move(*LoopDesc));
-  }
-
-  Descriptor.Accesses = collectMemoryAccesses(Descriptor.Loops);
-  return Descriptor;
-}
-
-std::optional<LoopNestDescriptor> analyzeLoopNest(Loop &Root,
-                                                  ScalarEvolution &SE) {
+std::optional<LoopNestDescriptor> analyzeLoopNest(Loop &Root, ScalarEvolution &SE) {
   SmallVector<Loop *, 4> PerfectLoops = linearizePerfectNest(Root);
-  if (PerfectLoops.size() < 2) {
-    return std::nullopt;
-  }
+  if (PerfectLoops.size() < 2) return std::nullopt;
 
   LoopNestDescriptor Descriptor;
   for (Loop *LoopNode : PerfectLoops) {
-    std::optional<LoopDescriptor> LoopDesc = buildLoopDescriptor(*LoopNode);
-    if (!LoopDesc) {
-      return std::nullopt;
-    }
+    std::optional<LoopDescriptor> LoopDesc = buildLoopDescriptor(*LoopNode, SE);
+    if (!LoopDesc) return std::nullopt;
     Descriptor.Loops.push_back(std::move(*LoopDesc));
   }
 
-  Descriptor.Accesses = collectMemoryAccesses(Descriptor.Loops);
+  Descriptor.Accesses = collectMemoryAccesses(Descriptor.Loops, SE);
   return Descriptor;
 }
 
-bool isRectangularPair(const LoopDescriptor &Outer, const LoopDescriptor &Inner) {
-  if (Outer.LoopNode == nullptr || Inner.LoopNode == nullptr ||
-      Outer.Induction == nullptr || Inner.Induction == nullptr) {
-    return false;
-  }
+bool exprMentionsSymbol(const AffineExpr &Expr, const Value *Symbol) {
+  return llvm::any_of(Expr.Terms, [&](const AffineTerm &Term) {
+    return Term.Symbol == Symbol && Term.Coefficient != 0;
+  });
+}
 
-  if (Outer.Bounds.Step != 1 || Inner.Bounds.Step != 1) {
-    return false;
+bool isRectangularNest(const LoopNestDescriptor &Nest) {
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    if (Nest.Loops[i].Bounds.Step != 1) return false;
+    for (unsigned j = 0; j < i; ++j) {
+      if (exprMentionsSymbol(Nest.Loops[i].Bounds.Lower, Nest.Loops[j].Induction) ||
+          exprMentionsSymbol(Nest.Loops[i].Bounds.Upper, Nest.Loops[j].Induction)) {
+        return false;
+      }
+    }
   }
-
-  if (Outer.Induction->getType() != Inner.Induction->getType()) {
-    return false;
-  }
-
-  if (exprMentionsSymbol(Inner.Bounds.Lower, Outer.Induction) ||
-      exprMentionsSymbol(Inner.Bounds.Upper, Outer.Induction)) {
-    return false;
-  }
-
   return true;
 }
 
-bool hasUnsafeSameBaseDependence(const LoopNestDescriptor &Nest) {
-  for (size_t I = 0; I < Nest.Accesses.size(); ++I) {
-    for (size_t J = I + 1; J < Nest.Accesses.size(); ++J) {
-      const MemoryAccess &A = Nest.Accesses[I];
-      const MemoryAccess &B = Nest.Accesses[J];
+// --------------------------------------------------------------------------
+// Phase 2: N-Dimensional ISL Native Dependence Checking
+// --------------------------------------------------------------------------
 
-      if (A.BasePointer != B.BasePointer) {
-        continue;
-      }
-
-      if (A.AccessKind != MemoryAccess::Kind::Store &&
-          B.AccessKind != MemoryAccess::Kind::Store) {
-        continue;
-      }
-
-      if (A.Subscripts.size() != B.Subscripts.size()) {
-        return true;
-      }
-
-      for (size_t Dim = 0; Dim < A.Subscripts.size(); ++Dim) {
-        if (!exprEquals(A.Subscripts[Dim], B.Subscripts[Dim])) {
-          return true;
-        }
-      }
-    }
+std::string sanitizeISLName(std::string Name) {
+  std::string Clean = "";
+  for (char C : Name) {
+    if (std::isalnum(C)) Clean += C;
+    else Clean += "_";
   }
-
-  return false;
+  if (!Clean.empty() && std::isdigit(Clean[0])) Clean = "V_" + Clean;
+  if (Clean.empty()) Clean = "unknown";
+  return Clean;
 }
 
-bool isInterchangeProfitable(const LoopNestDescriptor &Nest) {
-  if (Nest.depth() < 2) {
-    return false;
+std::string toISLString(const AffineExpr &Expr) {
+  std::string Buffer;
+  raw_string_ostream OS(Buffer);
+  bool Printed = false;
+  if (Expr.Constant != 0 || Expr.Terms.empty()) {
+    OS << Expr.Constant;
+    Printed = true;
   }
+  for (const AffineTerm &Term : Expr.Terms) {
+    if (Printed && Term.Coefficient > 0) OS << " + ";
+    else if (Printed && Term.Coefficient < 0) OS << " - ";
+    else if (!Printed && Term.Coefficient < 0) OS << "-";
 
-  const Value *OuterIV = Nest.Loops[0].Induction;
-  const Value *InnerIV = Nest.Loops[1].Induction;
+    int64_t AbsCoeff = std::abs(Term.Coefficient);
+    if (AbsCoeff != 1 || Term.Symbol == nullptr) {
+      OS << AbsCoeff;
+      if (Term.Symbol != nullptr) OS << "*";
+    }
+    if (Term.Symbol != nullptr) {
+      OS << sanitizeISLName(valueNameOrFallback(Term.Symbol, "sym"));
+    }
+    Printed = true;
+  }
+  return OS.str();
+}
 
-  int CurrentScore = 0;
-  int SwappedScore = 0;
+std::string buildISLTuple(const LoopNestDescriptor &Nest, StringRef Suffix = "") {
+  std::string Res = "Stmt[";
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    if (i > 0) Res += ", ";
+    Res += sanitizeISLName(Nest.Loops[i].InductionName) + Suffix.str();
+  }
+  Res += "]";
+  return Res;
+}
+
+isl_union_map *getDependencies(const LoopNestDescriptor &Nest, isl_ctx *ctx) {
+  std::string Tuple = buildISLTuple(Nest);
+  std::string TupleP = buildISLTuple(Nest, "_p");
+
+  std::string DomainStr = "{ " + Tuple + " : ";
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    if (i > 0) DomainStr += " and ";
+    std::string IV = sanitizeISLName(Nest.Loops[i].InductionName);
+    DomainStr += toISLString(Nest.Loops[i].Bounds.Lower) + " <= " + IV + " < " + toISLString(Nest.Loops[i].Bounds.Upper);
+  }
+  DomainStr += " }";
+
+  std::string ReadStr = "{ ";
+  std::string WriteStr = "{ ";
+  bool HasReads = false, HasWrites = false;
 
   for (const MemoryAccess &Access : Nest.Accesses) {
-    const int OuterPos = findSubscriptPosition(Access, OuterIV);
-    const int InnerPos = findSubscriptPosition(Access, InnerIV);
-    if (OuterPos == 0 || InnerPos == 0 || OuterPos == InnerPos) {
-      continue;
+    std::string MapElem = Tuple + " -> " + sanitizeISLName(Access.BaseName) + "[";
+    if (Access.Subscripts.empty()) MapElem += "0";
+    else {
+      for (size_t k = 0; k < Access.Subscripts.size(); ++k) {
+        if (k > 0) MapElem += ", ";
+        MapElem += toISLString(Access.Subscripts[k]);
+      }
     }
+    MapElem += "]";
 
-    if (InnerPos > OuterPos) {
-      ++CurrentScore;
+    if (Access.AccessKind == MemoryAccess::Kind::Load) {
+      if (HasReads) ReadStr += "; ";
+      ReadStr += MapElem;
+      HasReads = true;
     } else {
-      ++SwappedScore;
+      if (HasWrites) WriteStr += "; ";
+      WriteStr += MapElem;
+      HasWrites = true;
     }
   }
+  ReadStr += " }";
+  WriteStr += " }";
 
-  return SwappedScore > CurrentScore && SwappedScore > 0;
-}
+  if (!HasReads) ReadStr = "{}";
+  if (!HasWrites) WriteStr = "{}";
 
-bool setCompareBound(LoopDescriptor &Descriptor, Value *NewBound) {
-  if (Descriptor.Compare == nullptr || NewBound == nullptr ||
-      Descriptor.Induction == nullptr) {
-    return false;
+  isl_union_set *Domain = isl_union_set_read_from_str(ctx, DomainStr.c_str());
+  isl_union_map *Reads = isl_union_map_read_from_str(ctx, ReadStr.c_str());
+  isl_union_map *Writes = isl_union_map_read_from_str(ctx, WriteStr.c_str());
+
+  if (!Domain || !Reads || !Writes) {
+    if (Domain) isl_union_set_free(Domain);
+    if (Reads) isl_union_map_free(Reads);
+    if (Writes) isl_union_map_free(Writes);
+    return nullptr;
   }
 
-  Descriptor.Compare->setOperand(1, NewBound);
-  Descriptor.BoundValue = NewBound;
-  Descriptor.Bounds.Upper = makeExprFromValue(NewBound);
-  return true;
-}
+  Reads = isl_union_map_intersect_domain(Reads, isl_union_set_copy(Domain));
+  Writes = isl_union_map_intersect_domain(Writes, isl_union_set_copy(Domain));
 
-bool swapBodyInductionUses(LoopDescriptor &Outer, LoopDescriptor &Inner) {
-  PHINode *OuterIV = Outer.Induction;
-  PHINode *InnerIV = Inner.Induction;
-  Loop *InnerLoop = Inner.LoopNode;
-  BasicBlock *InnerHeader = InnerLoop->getHeader();
-  if (OuterIV == nullptr || InnerIV == nullptr || InnerLoop == nullptr ||
-      InnerHeader == nullptr) {
-    return false;
-  }
+  isl_union_map *WW = isl_union_map_apply_range(isl_union_map_copy(Writes), isl_union_map_reverse(isl_union_map_copy(Writes)));
+  isl_union_map *WR = isl_union_map_apply_range(isl_union_map_copy(Writes), isl_union_map_reverse(isl_union_map_copy(Reads)));
+  isl_union_map *RW = isl_union_map_apply_range(isl_union_map_copy(Reads), isl_union_map_reverse(isl_union_map_copy(Writes)));
 
-  IRBuilder<> Builder(&*InnerHeader->getFirstInsertionPt());
-  Value *Zero = ConstantInt::get(OuterIV->getType(), 0);
-  Value *OuterReplacement =
-      Builder.CreateAdd(InnerIV, Zero, Outer.InductionName + ".swapped");
-  Value *InnerReplacement =
-      Builder.CreateAdd(OuterIV, Zero, Inner.InductionName + ".swapped");
+  isl_union_map *Conflicts = isl_union_map_union(isl_union_map_union(WW, WR), RW);
 
-  BasicBlock *InnerLatch = InnerLoop->getLoopLatch();
-  bool Changed = false;
-
-  for (BasicBlock *BB : InnerLoop->blocks()) {
-    if (BB == InnerHeader || BB == InnerLatch) {
-      continue;
+  std::string BeforeStr = "{ " + Tuple + " -> " + TupleP + " : ";
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    if (i > 0) BeforeStr += " or (";
+    for (unsigned j = 0; j < i; ++j) {
+      std::string IV = sanitizeISLName(Nest.Loops[j].InductionName);
+      BeforeStr += IV + " == " + IV + "_p and ";
     }
+    std::string IVi = sanitizeISLName(Nest.Loops[i].InductionName);
+    BeforeStr += IVi + " < " + IVi + "_p";
+  }
+  for (unsigned i = 1; i < Nest.depth(); ++i) BeforeStr += ")";
+  BeforeStr += " }";
 
-    for (Instruction &Inst : *BB) {
-      for (unsigned OperandIndex = 0; OperandIndex < Inst.getNumOperands();
-           ++OperandIndex) {
-        Value *Operand = Inst.getOperand(OperandIndex);
-        if (Operand == OuterIV) {
-          Inst.setOperand(OperandIndex, OuterReplacement);
-          Changed = true;
-        } else if (Operand == InnerIV) {
-          Inst.setOperand(OperandIndex, InnerReplacement);
-          Changed = true;
-        }
-      }
+  isl_union_map *Before = isl_union_map_read_from_str(ctx, BeforeStr.c_str());
+  isl_union_map *Deps = isl_union_map_intersect(Conflicts, Before);
+
+  isl_union_set_free(Domain);
+  isl_union_map_free(Reads);
+  isl_union_map_free(Writes);
+
+  return Deps;
+}
+
+bool isTilingLegal(const LoopNestDescriptor &Nest, isl_union_map *Deps, isl_ctx *ctx) {
+  if (Nest.depth() < 2 || !Deps) return false;
+
+  std::string Tuple = buildISLTuple(Nest);
+  std::string TupleP = buildISLTuple(Nest, "_p");
+  bool IsLegal = true;
+
+  for (unsigned k = 0; k < Nest.depth(); ++k) {
+    std::string KStr = sanitizeISLName(Nest.Loops[k].InductionName);
+    std::string NegativeDistStr = "{ " + Tuple + " -> " + TupleP + " : " +
+                                  KStr + "_p < " + KStr + " }";
+
+    isl_union_map *NegativeDist = isl_union_map_read_from_str(ctx, NegativeDistStr.c_str());
+    isl_union_map *Violations = isl_union_map_intersect(isl_union_map_copy(Deps), NegativeDist);
+    
+    if (!isl_union_map_is_empty(Violations)) {
+      IsLegal = false;
+      isl_union_map_free(Violations);
+      break; 
+    }
+    isl_union_map_free(Violations);
+  }
+
+  if (!IsLegal) {
+    errs() << "[" << kPassName << "] Polyhedral operations illegal: ISL detected negative dependence distance.\n";
+  } else {
+    errs() << "[" << kPassName << "] ISL verified " << Nest.depth() << "-Deep band is fully permutable!\n";
+  }
+  return IsLegal;
+}
+
+// --------------------------------------------------------------------------
+// Phase 3: Loop Interchange & Tiling
+// --------------------------------------------------------------------------
+
+bool applyLoopInterchange(LoopNestDescriptor &Nest, unsigned IdxOuter, unsigned IdxInner) {
+  LoopDescriptor &OuterLD = Nest.Loops[IdxOuter];
+  LoopDescriptor &InnerLD = Nest.Loops[IdxInner];
+  
+  if (OuterLD.Induction->getType() != InnerLD.Induction->getType()) {
+    errs() << "[" << kPassName << "] Interchange failed: IV types mismatch.\n";
+    return false;
+  }
+  
+  // 1. Swap incoming Start Values (Preheader incoming to PHI)
+  BasicBlock *PreOuter = OuterLD.LoopNode->getLoopPreheader();
+  BasicBlock *PreInner = InnerLD.LoopNode->getLoopPreheader();
+  int PreIdxOuter = OuterLD.Induction->getBasicBlockIndex(PreOuter);
+  int PreIdxInner = InnerLD.Induction->getBasicBlockIndex(PreInner);
+  
+  OuterLD.Induction->setIncomingValue(PreIdxOuter, InnerLD.StartValue);
+  InnerLD.Induction->setIncomingValue(PreIdxInner, OuterLD.StartValue);
+  
+  // 2. Swap Bounds in Compare Instructions
+  OuterLD.Compare->setOperand(1, InnerLD.BoundValue);
+  InnerLD.Compare->setOperand(1, OuterLD.BoundValue);
+  
+  // 3. Swap IV uses in the payload (Exclude loop control instructions)
+  auto isControlInst = [](LoopDescriptor &LD, User *U) {
+    if (U == LD.NextValue || U == LD.Compare) return true;
+    if (auto *PN = dyn_cast<PHINode>(U)) {
+      if (PN->getParent() == LD.LoopNode->getHeader()) return true;
+      BasicBlock *Exit = LD.LoopNode->getExitBlock();
+      if (Exit && PN->getParent() == Exit) return true;
+    }
+    return false;
+  };
+  
+  SmallVector<Use*, 8> OuterUses;
+  SmallVector<Use*, 8> InnerUses;
+  for (Use &U : OuterLD.Induction->uses()) {
+    if (!isControlInst(OuterLD, U.getUser())) OuterUses.push_back(&U);
+  }
+  for (Use &U : InnerLD.Induction->uses()) {
+    if (!isControlInst(InnerLD, U.getUser())) InnerUses.push_back(&U);
+  }
+  
+  for (Use *U : OuterUses) U->set(InnerLD.Induction);
+  for (Use *U : InnerUses) U->set(OuterLD.Induction);
+  
+  // 4. Update the LoopDescriptor semantics 
+  // (We purposefully DO NOT swap the structural LoopNode/Induction pointers to maintain tree layout)
+  std::swap(OuterLD.StartValue, InnerLD.StartValue);
+  std::swap(OuterLD.BoundValue, InnerLD.BoundValue);
+  std::swap(OuterLD.Bounds, InnerLD.Bounds);
+  std::swap(OuterLD.InductionName, InnerLD.InductionName);
+
+  // Rename in IR for clarity
+  StringRef OuterName = OuterLD.Induction->getName();
+  StringRef InnerName = InnerLD.Induction->getName();
+  OuterLD.Induction->setName(InnerName + ".interchanged");
+  InnerLD.Induction->setName(OuterName + ".interchanged");
+
+  return true;
+}
+
+bool optimizeLoopOrder(LoopNestDescriptor &Nest) {
+  if (Nest.depth() < 2) return false;
+  
+  // Simple heuristic: find which IV is used in the last subscript of the most memory accesses
+  std::map<Value*, int> Score;
+  for (const auto &Access : Nest.Accesses) {
+    if (Access.Subscripts.empty()) continue;
+    const AffineExpr &LastSub = Access.Subscripts.back();
+    for (const AffineTerm &Term : LastSub.Terms) {
+      if (Term.Symbol) Score[const_cast<Value*>(Term.Symbol)]++;
     }
   }
-
-  return Changed;
-}
-
-bool interchangeLoops(LoopNestDescriptor &Nest) {
-  if (Nest.depth() < 2) {
-    return false;
+  
+  Value *BestIV = nullptr;
+  int MaxScore = 0;
+  for (auto &Pair : Score) {
+    if (Pair.second > MaxScore) {
+      MaxScore = Pair.second;
+      BestIV = Pair.first;
+    }
   }
-
-  LoopDescriptor &Outer = Nest.Loops[0];
-  LoopDescriptor &Inner = Nest.Loops[1];
-
-  if (!isRectangularPair(Outer, Inner)) {
-    return false;
-  }
-
-  BasicBlock *OuterPreheader = Outer.LoopNode->getLoopPreheader();
-  BasicBlock *InnerPreheader = Inner.LoopNode->getLoopPreheader();
-  if (OuterPreheader == nullptr || InnerPreheader == nullptr) {
-    return false;
-  }
-
-  Value *OldOuterStart = Outer.StartValue;
-  Value *OldInnerStart = Inner.StartValue;
-  Value *OldOuterBound = Outer.BoundValue;
-  Value *OldInnerBound = Inner.BoundValue;
-  if (OldOuterStart == nullptr || OldInnerStart == nullptr ||
-      OldOuterBound == nullptr || OldInnerBound == nullptr) {
-    return false;
-  }
-
-  Outer.Induction->setIncomingValueForBlock(OuterPreheader, OldInnerStart);
-  Inner.Induction->setIncomingValueForBlock(InnerPreheader, OldOuterStart);
-  Outer.StartValue = OldInnerStart;
-  Inner.StartValue = OldOuterStart;
-  Outer.Bounds.Lower = makeExprFromValue(OldInnerStart);
-  Inner.Bounds.Lower = makeExprFromValue(OldOuterStart);
-
-  bool RewroteBody = swapBodyInductionUses(Outer, Inner);
-  if (!setCompareBound(Outer, OldInnerBound) ||
-      !setCompareBound(Inner, OldOuterBound)) {
-    return false;
-  }
-
-  if (!RewroteBody) {
-    return false;
-  }
-
-  errs() << "[" << kPassName << "] interchanged loops "
-         << Outer.InductionName << " <-> " << Inner.InductionName << "\n";
-  return true;
-}
-
-bool tryBlocking(LoopNestDescriptor &Nest, LoopStandardAnalysisResults &AR) {
-  if (!PolyEnableBlocking || Nest.depth() < 2) {
-    return false;
-  }
-
-  Loop *Outer = Nest.Loops[0].LoopNode;
-  if (Outer == nullptr) {
-    return false;
-  }
-
-  unsigned TripCount = AR.SE.getSmallConstantTripCount(Outer);
-  if (TripCount < 2) {
-    return false;
-  }
-
-  unsigned Count = std::min<unsigned>(PolyTileSize, TripCount);
-  if (Count < 2) {
-    return false;
-  }
-
-  Function *F = Outer->getHeader()->getParent();
-  DependenceInfo DI(F, &AR.AA, &AR.SE, &AR.LI);
-  if (!isSafeToUnrollAndJam(Outer, AR.SE, AR.DT, DI, AR.LI)) {
-    errs() << "[" << kPassName
-           << "] blocking skipped: unroll-and-jam safety check failed\n";
-    return false;
-  }
-
-  Loop *EpilogueLoop = nullptr;
-  LoopUnrollResult Result = UnrollAndJamLoop(
-      Outer, Count, TripCount, 1, true, &AR.LI, &AR.SE, &AR.DT, &AR.AC,
-      &AR.TTI, nullptr, &EpilogueLoop);
-
-  if (Result == LoopUnrollResult::Unmodified) {
-    errs() << "[" << kPassName
-           << "] blocking skipped: utility declined the transform\n";
-    return false;
-  }
-
-  errs() << "[" << kPassName << "] applied blocking factor " << Count << "\n";
-  return true;
-}
-
-bool unrollLoopByCount(Loop *L, unsigned Count, bool Runtime,
-                       LoopStandardAnalysisResults &AR) {
-  if (L == nullptr || Count < 2) {
-    return false;
-  }
-
-  UnrollLoopOptions Options;
-  Options.Count = Count;
-  Options.Force = true;
-  Options.Runtime = Runtime;
-  Options.AllowExpensiveTripCount = true;
-  Options.UnrollRemainder = true;
-  Options.ForgetAllSCEV = false;
-  Options.SCEVExpansionBudget = 32;
-
-  Loop *RemainderLoop = nullptr;
-  LoopUnrollResult Result =
-      UnrollLoop(L, Options, &AR.LI, &AR.SE, &AR.DT, &AR.AC, &AR.TTI, nullptr,
-                 true, &RemainderLoop, &AR.AA);
-
-  if (Result == LoopUnrollResult::Unmodified) {
-    return false;
-  }
-  return true;
-}
-
-bool hasSingleStore(const LoopNestDescriptor &Nest) {
-  return llvm::count_if(Nest.Accesses, [](const MemoryAccess &Access) {
-           return Access.AccessKind == MemoryAccess::Kind::Store;
-         }) == 1;
-}
-
-bool hasLoadStoreSeparation(const LoopNestDescriptor &Nest) {
-  const MemoryAccess *Store = nullptr;
-  for (const MemoryAccess &Access : Nest.Accesses) {
-    if (Access.AccessKind == MemoryAccess::Kind::Store) {
-      Store = &Access;
+  
+  if (!BestIV) return false;
+  
+  unsigned BestIdx = 0;
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    if (Nest.Loops[i].Induction == BestIV) {
+      BestIdx = i;
       break;
     }
   }
-  if (Store == nullptr) {
+  
+  // Interchange if the best dimension for spatial locality isn't already innermost
+  unsigned InnermostIdx = Nest.depth() - 1;
+  if (BestIdx != InnermostIdx) {
+    errs() << "[" << kPassName << "] Interchanging loop '" << Nest.Loops[BestIdx].InductionName 
+           << "' with innermost loop '" << Nest.Loops[InnermostIdx].InductionName 
+           << "' to maximize spatial locality.\n";
+    return applyLoopInterchange(Nest, BestIdx, InnermostIdx);
+  }
+  return false;
+}
+
+bool applyPolyhedralTiling(LoopNestDescriptor &Nest, Function &F) {
+  if (!PolyEnableBlocking || Nest.depth() < 2) return false;
+  
+  LLVMContext &Ctx = F.getContext();
+  unsigned TSize = PolyTileSize;
+  
+  Loop *OutermostLoop = Nest.Loops[0].LoopNode;
+  BasicBlock *OriginalPreheader = OutermostLoop->getLoopPreheader();
+  BasicBlock *OriginalHeader = OutermostLoop->getHeader();
+  BasicBlock *OriginalExit = OutermostLoop->getExitBlock();
+  
+  if (!OriginalPreheader || !OriginalExit) {
+    errs() << "[" << kPassName << "] Tiling failed: Outermost loop lacks canonical preheader/exit.\n";
     return false;
   }
 
-  for (const MemoryAccess &Access : Nest.Accesses) {
-    if (Access.AccessKind != MemoryAccess::Kind::Load) {
-      continue;
+  Type *IVType = Nest.Loops[0].Induction->getType();
+  Value *TileSizeVal = ConstantInt::get(IVType, TSize);
+  
+  std::vector<TileLoop> TileLoops(Nest.depth());
+  BasicBlock *CurrentPreheader = OriginalPreheader;
+  
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    LoopDescriptor &LD = Nest.Loops[i];
+    std::string TName = "tile." + LD.InductionName;
+    
+    BasicBlock *THeader = BasicBlock::Create(Ctx, TName + ".header", &F, OriginalHeader);
+    BasicBlock *TLatch = BasicBlock::Create(Ctx, TName + ".latch", &F, OriginalHeader);
+    
+    CurrentPreheader->getTerminator()->replaceSuccessorWith(
+      CurrentPreheader->getTerminator()->getSuccessor(0), THeader);
+      
+    IRBuilder<> HeaderBuilder(THeader);
+    PHINode *TInduction = HeaderBuilder.CreatePHI(IVType, 2, TName + ".iv");
+    TInduction->addIncoming(LD.StartValue, CurrentPreheader);
+    
+    IRBuilder<> LatchBuilder(TLatch);
+    Value *TNext = LatchBuilder.CreateAdd(TInduction, TileSizeVal, TName + ".next");
+    TInduction->addIncoming(TNext, TLatch);
+    
+    Value *TCmp = LatchBuilder.CreateICmp(LD.Predicate, TNext, LD.BoundValue, TName + ".cmp");
+    BranchInst *LatchBr = LatchBuilder.CreateCondBr(TCmp, THeader, TLatch); 
+    
+    TileLoops[i] = {THeader, TLatch, TInduction, TNext};
+    CurrentPreheader = THeader; 
+  }
+  
+  IRBuilder<> InnerTileHeaderBuilder(TileLoops.back().Header);
+  InnerTileHeaderBuilder.CreateBr(OriginalHeader);
+  
+  for (BasicBlock *Pred : predecessors(OriginalExit)) {
+    if (Pred != TileLoops[0].Latch) { 
+      Pred->getTerminator()->replaceSuccessorWith(OriginalExit, TileLoops.back().Latch);
     }
-
-    if (Access.BasePointer == Store->BasePointer) {
-      if (Access.Subscripts.size() != Store->Subscripts.size()) {
-        return false;
+  }
+  
+  for (unsigned i = Nest.depth() - 1; i > 0; --i) {
+    BranchInst *LatchBr = cast<BranchInst>(TileLoops[i].Latch->getTerminator());
+    LatchBr->setSuccessor(1, TileLoops[i-1].Latch);
+  }
+  
+  BranchInst *OutermostLatchBr = cast<BranchInst>(TileLoops[0].Latch->getTerminator());
+  OutermostLatchBr->setSuccessor(1, OriginalExit);
+  
+  for (unsigned i = 0; i < Nest.depth(); ++i) {
+    LoopDescriptor &LD = Nest.Loops[i];
+    TileLoop &TL = TileLoops[i];
+    
+    for (unsigned j = 0; j < LD.Induction->getNumIncomingValues(); ++j) {
+      if (!LD.LoopNode->contains(LD.Induction->getIncomingBlock(j))) {
+        LD.Induction->setIncomingValue(j, TL.Induction);
       }
-      for (size_t I = 0; I < Access.Subscripts.size(); ++I) {
-        if (!exprEquals(Access.Subscripts[I], Store->Subscripts[I])) {
-          return false;
-        }
-      }
+    }
+    
+    BasicBlock *PointPreheader = LD.LoopNode->getLoopPreheader();
+    IRBuilder<> BoundBuilder(PointPreheader->getTerminator());
+    
+    Value *EndBound = BoundBuilder.CreateAdd(TL.Induction, TileSizeVal, "clamp." + LD.InductionName + ".end");
+    Value *Cmp = BoundBuilder.CreateICmp(LD.Predicate, EndBound, LD.BoundValue, "clamp." + LD.InductionName + ".cmp");
+    Value *MinBound = BoundBuilder.CreateSelect(Cmp, EndBound, LD.BoundValue, "clamp." + LD.InductionName + ".min");
+    
+    if (LD.Compare) {
+      LD.Compare->setOperand(1, MinBound);
     }
   }
 
-  return true;
+  errs() << "[" << kPassName << "] Successfully tiled " << Nest.depth() 
+         << " loops with block size " << TSize << ".\n";
+         
+  return true; 
 }
 
-bool trySmallKernelUnroll(LoopNestDescriptor &Nest, LoopStandardAnalysisResults &AR) {
-  if (Nest.depth() < 2) {
-    return false;
-  }
-
-  bool Changed = false;
-
-  // Full-unroll tiny affine kernel loops such as the 5x5 conv stencil.
-  for (int Index = static_cast<int>(Nest.Loops.size()) - 1; Index >= 0; --Index) {
-    Loop *L = Nest.Loops[static_cast<size_t>(Index)].LoopNode;
-    unsigned TripCount =
-        getConstantTripCount(Nest.Loops[static_cast<size_t>(Index)])
-            .value_or(AR.SE.getSmallConstantTripCount(L));
-    if (TripCount >= 2 && TripCount <= 8) {
-      if (unrollLoopByCount(L, TripCount, false, AR)) {
-        errs() << "[" << kPassName << "] fully unrolled tiny kernel loop "
-               << Nest.Loops[static_cast<size_t>(Index)].InductionName
-               << " by " << TripCount << "\n";
-        Changed = true;
-      }
-    }
-  }
-
-  return Changed;
-}
-
-bool tryStreamingInnerUnroll(LoopNestDescriptor &Nest,
-                             LoopStandardAnalysisResults &AR) {
-  if (Nest.depth() < 2 || !hasSingleStore(Nest) || !hasLoadStoreSeparation(Nest)) {
-    return false;
-  }
-
-  Loop *Inner = Nest.Loops.back().LoopNode;
-  unsigned TripCount = AR.SE.getSmallConstantTripCount(Inner);
-  if (TripCount < 8) {
-    return false;
-  }
-
-  unsigned Count = std::min<unsigned>(4, TripCount);
-  if (!unrollLoopByCount(Inner, Count, false, AR)) {
-    return false;
-  }
-
-  errs() << "[" << kPassName << "] unrolled streaming inner loop "
-         << Nest.Loops.back().InductionName << " by " << Count << "\n";
-  return true;
-}
-
-bool trySingleLoopFallback(Loop *L, LoopStandardAnalysisResults &AR) {
-  if (L == nullptr) {
-    return false;
-  }
-
-  LoopNestDescriptor Nest;
-  if (std::optional<LoopDescriptor> MaybeDesc = buildLoopDescriptor(*L)) {
-    Nest.Loops.push_back(std::move(*MaybeDesc));
-  }
-  Nest.Accesses = collectMemoryAccesses(L);
-
-  unsigned TripCount = AR.SE.getSmallConstantTripCount(L);
-  if (!L->getSubLoops().empty() || TripCount < 8 || !hasSingleStore(Nest) ||
-      !hasLoadStoreSeparation(Nest)) {
-    return false;
-  }
-
-  unsigned Count = std::min<unsigned>(4, TripCount);
-  if (!unrollLoopByCount(L, Count, false, AR)) {
-    return false;
-  }
-
-  errs() << "[" << kPassName << "] unrolled single streaming loop "
-         << valueNameOrFallback(L->getCanonicalInductionVariable(), "iv")
-         << " by " << Count << "\n";
-  return true;
-}
+// --------------------------------------------------------------------------
+// Pass Pipeline Registration
+// --------------------------------------------------------------------------
 
 void emitNestSummary(const LoopNestDescriptor &Nest, Function &F) {
   errs() << "[" << kPassName << "] analyzing function " << F.getName()
          << " with nest depth " << Nest.depth() << "\n";
-
-  for (const LoopDescriptor &LoopDesc : Nest.Loops) {
-    errs() << "  loop " << LoopDesc.InductionName << ": ["
-           << LoopDesc.Bounds.Lower.str() << ", "
-           << LoopDesc.Bounds.Upper.str() << ") step " << LoopDesc.Bounds.Step
-           << "\n";
-  }
-
-  for (const MemoryAccess &Access : Nest.Accesses) {
-    errs() << "  access " << Access.str() << "\n";
-  }
 }
 
 void collectLoopsRecursively(Loop *Root, SmallVectorImpl<Loop *> &Loops) {
-  if (Root == nullptr) {
-    return;
-  }
-
-  for (Loop *Child : Root->getSubLoops()) {
-    collectLoopsRecursively(Child, Loops);
-  }
+  if (!Root) return;
+  for (Loop *Child : Root->getSubLoops()) collectLoopsRecursively(Child, Loops);
   Loops.push_back(Root);
 }
 
@@ -909,9 +760,7 @@ class PolyhedralPass : public PassInfoMixin<PolyhedralPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
-    if (LI.empty()) {
-      return PreservedAnalyses::all();
-    }
+    if (LI.empty()) return PreservedAnalyses::all();
 
     LoopStandardAnalysisResults AR{
         FAM.getResult<AAManager>(F),
@@ -921,64 +770,46 @@ public:
         FAM.getResult<ScalarEvolutionAnalysis>(F),
         FAM.getResult<TargetLibraryAnalysis>(F),
         FAM.getResult<TargetIRAnalysis>(F),
-        nullptr,
-        nullptr,
-        nullptr,
+        nullptr, nullptr, nullptr,
     };
 
     SmallVector<Loop *, 16> Loops;
-    for (Loop *TopLevel : LI) {
-      collectLoopsRecursively(TopLevel, Loops);
-    }
+    for (Loop *TopLevel : LI) collectLoopsRecursively(TopLevel, Loops);
 
     bool Changed = false;
     for (Loop *Root : Loops) {
       std::optional<LoopNestDescriptor> MaybeNest = analyzeLoopNest(*Root, AR.SE);
-      if (!MaybeNest) {
-        continue;
-      }
+      if (!MaybeNest) continue;
 
       LoopNestDescriptor Nest = std::move(*MaybeNest);
       emitNestSummary(Nest, F);
 
-      if (!isRectangularPair(Nest.Loops[0], Nest.Loops[1])) {
-        errs() << "[" << kPassName
-               << "] skipped: nest is not rectangular/unit-stride\n";
+      if (!isRectangularNest(Nest)) {
+        errs() << "[" << kPassName << "] skipped: nest is not rectangular/unit-stride\n";
         continue;
       }
 
-      if (hasUnsafeSameBaseDependence(Nest)) {
-        errs() << "[" << kPassName
-               << "] skipped: conservative same-base dependence check failed\n";
+      isl_ctx *ctx = isl_ctx_alloc();
+      isl_union_map *Deps = getDependencies(Nest, ctx);
+
+      if (!Deps) {
+        errs() << "[" << kPassName << "] ISL engine failed to parse access bounds.\n";
+        isl_ctx_free(ctx);
         continue;
       }
 
       bool LocalChange = false;
-      if (isInterchangeProfitable(Nest)) {
-        LocalChange = interchangeLoops(Nest);
-      }
-
-      if (!LocalChange) {
-        LocalChange = trySmallKernelUnroll(Nest, AR);
-      }
-
-      if (!LocalChange) {
-        LocalChange = tryStreamingInnerUnroll(Nest, AR);
-      }
-
-      if (!LocalChange) {
-        LocalChange = tryBlocking(Nest, AR);
-      }
-
-      Changed |= LocalChange;
-    }
-
-    if (!Changed) {
-      for (Loop *Root : Loops) {
-        if (trySingleLoopFallback(Root, AR)) {
-          Changed = true;
+      
+      if (isTilingLegal(Nest, Deps, ctx)) {
+        if (PolyEnableInterchange) {
+          LocalChange |= optimizeLoopOrder(Nest);
         }
+        LocalChange |= applyPolyhedralTiling(Nest, F);
       }
+
+      isl_union_map_free(Deps);
+      isl_ctx_free(ctx);
+      Changed |= LocalChange;
     }
 
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
@@ -993,10 +824,7 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                    ArrayRef<PassBuilder::PipelineElement>) {
-                  if (Name != "polyhedral-pass") {
-                    return false;
-                  }
-
+                  if (Name != "polyhedral-pass") return false;
                   FPM.addPass(PolyhedralPass());
                   return true;
                 });

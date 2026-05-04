@@ -4,7 +4,7 @@ LLVM_CONFIG  = llvm-config
 
 # --- Flags ---
 # -g is included to help preserve some naming metadata
-CXXFLAGS     = -rdynamic $(shell $(LLVM_CONFIG) --cxxflags) -fPIC -g -std=c++20
+CXXFLAGS     = -rdynamic $(shell $(LLVM_CONFIG) --cxxflags) -fPIC -g -std=c++20 -I./isl/include
 LDFLAGS      = $(shell $(LLVM_CONFIG) --ldflags | tr '\n' ' ') -Wl,--exclude-libs,ALL
 
 # --- Directories ---
